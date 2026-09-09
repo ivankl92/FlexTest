@@ -107,9 +107,18 @@ On **PC 1**:
 
 ```bash
 sudo mkdir -p /home/tsn-testbed && sudo chown "$USER:$USER" /home/tsn-testbed
-tar xzf tsn-flextest-i226.tar.gz -C /home/tsn-testbed
+git clone https://github.com/ivankl92/FlexTest.git /home/tsn-testbed
 # result: /home/tsn-testbed/i226-adaptation/
 ```
+
+Cloning **into** `/home/tsn-testbed` rather than under it is deliberate: the
+repository root holds `i226-adaptation/`, so every path in this runbook —
+`/home/tsn-testbed/i226-adaptation/...` — resolves as written. `git clone`
+requires the target directory to be empty, which `mkdir -p` leaves it.
+
+To pick up later changes: `git -C /home/tsn-testbed pull`. If you have edited
+`config.conf` in place, commit or stash it first — `pull` will refuse to
+overwrite local changes.
 
 **Verify:** `/home/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists.
 
@@ -134,10 +143,12 @@ Clone it when you take on one of these, and not before:
 If so:
 
 ```bash
-git clone https://github.com/ivankl92/tsn-testbed.git /home/tsn-testbed/upstream
+git clone https://github.com/ivankl92/tsn-testbed.git /home/tsn-upstream
 ```
 
-Keep it unmodified — it is a reference, not a component.
+Keep it unmodified — it is a reference, not a component. Clone it outside
+`/home/tsn-testbed`: that directory is now this repository's working tree, and a
+second clone inside it would show up as untracked files.
 
 ---
 
@@ -163,8 +174,18 @@ sudo ssh -o BatchMode=yes ivank@172.16.28.17 'sudo -n true && echo OK'
 
 ### 5.2 Copy the pack to PC 2
 
+Clone the same repository on PC 2:
+
 ```bash
-ssh ivank@172.16.28.17 'sudo mkdir -p /home/tsn-testbed && sudo chown ivank:ivank /home/tsn-testbed'
+ssh ivank@172.16.28.17 'sudo mkdir -p /home/tsn-testbed && sudo chown ivank:ivank /home/tsn-testbed \
+    && git clone https://github.com/ivankl92/FlexTest.git /home/tsn-testbed'
+```
+
+If PC 1 carries local changes that are not committed and pushed — an edited
+`config.conf`, a patched script — copy the tree instead, so both nodes run
+identical code:
+
+```bash
 rsync -a /home/tsn-testbed/i226-adaptation/ ivank@172.16.28.17:/home/tsn-testbed/i226-adaptation/
 ```
 
@@ -281,8 +302,10 @@ Check the `tsn_tx` stderr line in `results/*/*/tx.log`:
 ```
 
 Below ~90 % the I226's TX-timestamp registers are saturating. Reduce
-`STREAM_RATE` (try 500, then 200) and re-check. This is the highest-ranked
-unknown in the design — see `REPORT.md` §8.
+`STREAM_RATE` (try 500, then 200) and re-check. This was the highest-ranked
+unknown in the design until it was measured: on kernel `6.8.1-1058-realtime`
+with `igc`, yield held at 100 % from 200 to 20 000 fps. Re-measure after a
+kernel or NIC change — see `REPORT.md` §8.
 
 ---
 
@@ -493,7 +516,7 @@ indexed by priority, and its value is the traffic class.
 
 ## 13. Teardown
 
-No teardown script exists yet (open item #19 in `REPORT.md`). To restore a
+No teardown script exists yet (open item #20 in `REPORT.md`). To restore a
 machine by hand:
 
 ```bash

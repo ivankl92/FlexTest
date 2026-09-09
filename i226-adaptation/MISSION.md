@@ -173,8 +173,13 @@ gate without either fixing it or reporting it.
 
 ```bash
 sudo mkdir -p /home/tsn-testbed && sudo chown ivank:ivank /home/tsn-testbed
-# place this pack at /home/tsn-testbed/i226-adaptation/
+git clone https://github.com/ivankl92/FlexTest.git /home/tsn-testbed
+# result: /home/tsn-testbed/i226-adaptation/
 ```
+
+Clone **into** `/home/tsn-testbed`, not under it: the repository root holds
+`i226-adaptation/`, so every path below resolves as written. `git clone` needs
+the target directory empty, which `mkdir -p` leaves it.
 
 **The upstream clone is optional and is NOT a dependency.** No script, tool or
 analysis in this pack reads, imports or executes anything from it — the only
@@ -184,8 +189,9 @@ that use it (see `docs/REPORT.md` §9): the upstream-schema adapter (#1),
 confidence intervals (#2), TAS (#12) or realistic traffic profiles (#15).
 
 ```bash
-# optional, for the open items above:
-git clone https://github.com/ivankl92/tsn-testbed.git /home/tsn-testbed/upstream
+# optional, for the open items above. Clone it OUTSIDE /home/tsn-testbed —
+# that directory is this repository's working tree.
+git clone https://github.com/ivankl92/tsn-testbed.git /home/tsn-upstream
 ```
 
 **Gate:** `/home/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists.
@@ -206,9 +212,16 @@ prints `OK`.
 ### Step 3 — Copy the pack to PC 2 and set up both nodes
 
 ```bash
+ssh ivank@172.16.28.17 'sudo mkdir -p /home/tsn-testbed && sudo chown ivank:ivank /home/tsn-testbed \
+    && git clone https://github.com/ivankl92/FlexTest.git /home/tsn-testbed'
+```
+
+If PC 1 has local changes that are not committed and pushed, copy the tree
+instead so both nodes run identical code:
+
+```bash
 rsync -a /home/tsn-testbed/i226-adaptation/ ivank@172.16.28.17:/home/tsn-testbed/i226-adaptation/
 ```
-(Create `/home/tsn-testbed` on PC2 first, owned by `ivank`.)
 
 On **PC 2** (listener):
 ```bash

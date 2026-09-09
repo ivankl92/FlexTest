@@ -33,7 +33,8 @@ contention is the experiment.
 Everything lives under `i226-adaptation/`; run from there.
 
 ```bash
-cd i226-adaptation
+git clone https://github.com/ivankl92/FlexTest.git
+cd FlexTest/i226-adaptation
 
 # 1. before anything else — confirm the NIC can timestamp at your target rate
 gcc -O2 -o /tmp/tsn_tx tools/tsn_tx.c

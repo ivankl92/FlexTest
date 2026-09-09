@@ -1,15 +1,19 @@
-Paste this to Claude Code running on PC 1 (172.16.0.91), after unpacking
-tsn-flextest-i226.tar.gz so that MISSION.md sits at
-/home/tsn-testbed/i226-adaptation/MISSION.md
+Paste this to Claude Code running on PC 1 (172.16.0.91), after
+
+    sudo mkdir -p /home/tsn-testbed && sudo chown "$USER:$USER" /home/tsn-testbed
+    git clone https://github.com/ivankl92/FlexTest.git /home/tsn-testbed
+
+so that MISSION.md sits at /home/tsn-testbed/i226-adaptation/MISSION.md
 ------------------------------------------------------------------------------
 
 Read /home/tsn-testbed/i226-adaptation/MISSION.md and carry out the whole
 mission described in it, autonomously, from step 1 to step 7.
 
-You are on PC 1 of a two-PC TSN testbed. The mission file has the topology,
-credentials, the design decisions that are already settled (do not re-litigate
-them), the scripts to run, the verification gate after each step, and the known
-failure modes with their fixes.
+You are on PC 1 of a two-PC TSN testbed. The mission file has the topology, the
+design decisions that are already settled (do not re-litigate them), the scripts
+to run, the verification gate after each step, and the known failure modes with
+their fixes. It deliberately carries no password — bootstrap_ssh.sh prompts for
+PC 2's, so ask me when it does.
 
 Rules:
 - Work through the steps in order. Do not skip a gate.
