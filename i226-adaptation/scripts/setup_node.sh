@@ -158,7 +158,15 @@ ptp_dst_mac             01:80:C2:00:00:0E
 network_transport       L2
 delay_mechanism         P2P
 time_stamping           hardware
-tx_timestamp_timeout    50
+# How long ptp4l waits for the NIC to return the TX timestamp of its own PTP
+# frame. linuxptp's default is 1 ms; 50 ms was already generous, and it was
+# still not enough here. At 105% background load on the second port pair, the
+# TX-timestamp path stalls long enough that ptp4l times out, logs "timed out
+# while polling for tx timestamp" and puts the port in portState FAULTY — from
+# which it did not recover, so every later measurement point was skipped.
+# 200 ms buys headroom under oversubscription. It costs nothing when the path
+# is healthy: the timeout is an upper bound, not a delay.
+tx_timestamp_timeout    200
 step_threshold          0.00002
 summary_interval        4
 EOF

@@ -74,12 +74,44 @@ ptp_state() {
   echo "$out" | grep -E 'portState' | awk '{print $2}' | head -1
 }
 
+# A ptp4l port that hits a transport error — most often "timed out while
+# polling for tx timestamp" when the NIC's TX-timestamp path is saturated —
+# goes to portState FAULTY. Observed on PC 1 at 105 % background load, where it
+# then stayed FAULTY for the rest of the campaign and every remaining point was
+# skipped. ptp4l's own fault_reset_interval did not bring it back, so restart
+# the unit once and give it time to re-acquire.
+ptp_recover() {   # $1 = "local" | "remote", $2 = interface
+  local where="$1" ifc="$2"
+  warn "  ptp4l on ${where} port ${ifc} is FAULTY - restarting the unit once"
+  if [[ "$where" == "local" ]]; then
+    systemctl reset-failed "ptp4l@${ifc}" 2>/dev/null || true
+    systemctl restart "ptp4l@${ifc}" 2>/dev/null || true
+  else
+    $RSH "$PC2" "sudo systemctl reset-failed ptp4l@${ifc}; sudo systemctl restart ptp4l@${ifc}" \
+      2>/dev/null || true
+  fi
+  sleep 20
+}
+
 check_ptp() {
   local s1 s2 o1 o2
   s1=$(ptp_state local);  o1=$(ptp_offset local)
   s2=$(ptp_state remote); o2=$(ptp_offset remote)
   log "  gPTP: PC1 state=${s1:-?} offset=${o1:-?} ns | PC2 state=${s2:-?} offset=${o2:-?} ns"
   PTP_LAST="PC1:${s1:-?}/${o1:-?} PC2:${s2:-?}/${o2:-?}"
+
+  # Try once to clear a FAULTY port before reporting failure, otherwise a single
+  # fault poisons every subsequent measurement point.
+  if [[ "${PTP_NO_RECOVER:-0}" != "1" ]]; then
+    local recovered=0
+    [[ "$s1" == "FAULTY" ]] && { ptp_recover local  "$PC1_STREAM_IF"; recovered=1; }
+    [[ "$s2" == "FAULTY" ]] && { ptp_recover remote "$PC2_STREAM_IF"; recovered=1; }
+    if (( recovered )); then
+      PTP_NO_RECOVER=1 check_ptp
+      return $?
+    fi
+  fi
+
   for st in "$s1" "$s2"; do
     [[ "$st" == "SLAVE" || "$st" == "CLIENT" ]] || return 1
   done
@@ -264,6 +296,18 @@ EOF
     fi
     (( RXN < 1 )) && warn "  no frames received for $LABEL"
 
+    # A collapsed TX-timestamp yield means most frames have no tx_hw_ns and are
+    # dropped by the offline join, so the point is built from an unrepresentative
+    # subset. Mark it in the run directory rather than letting it look normal.
+    if (( SENT > 0 )); then
+      if [[ $(LC_ALL=C awk -v a="$TXN" -v b="$SENT" 'BEGIN{print (100*a/b < 90) ? 1 : 0}') == 1 ]]; then
+        warn "  TX-timestamp yield ${YIELD}% (<90%) - this point is NOT trustworthy"
+        warn "  the offline join keeps only timestamped frames, so it samples a biased subset"
+        echo "TX timestamp yield ${YIELD}% (${TXN}/${SENT}); below the 90% threshold." \
+          > "${CASE_DIR}/DEGRADED"
+      fi
+    fi
+
     sleep 5   # cool down, matches the original testbed's inter-run pause
   done
 done
@@ -273,5 +317,14 @@ done
 $RSH "$PC2" "sudo $INSTALL_DIR/qos_config.sh ${PC2_STREAM_IF} none" || true
 
 cp "$CONFIG" "${OUTDIR}/config.conf.used"
+
+# The campaign runs under sudo, so everything above was created as root. Hand
+# the results back to the invoking user, otherwise analyze_plot.py cannot write
+# summary.csv or figures/ into the run directory and dies with EACCES.
+if [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
+  chown -R "${SUDO_UID}:${SUDO_GID}" "$OUTDIR" 2>/dev/null || \
+    warn "could not chown $OUTDIR back to the invoking user"
+fi
+
 log "campaign complete: $OUTDIR"
 echo "$OUTDIR"

@@ -412,10 +412,33 @@ def main() -> int:
         print("no usable measurement points found", file=sys.stderr)
         return 1
 
+    # A point whose TX-timestamp yield collapsed is built from a biased subset
+    # of frames; run_measurement.sh marks it. Say so loudly — the latency
+    # figures for such a point are not comparable with the others.
+    for c in cases:
+        if (c["dir"] / "DEGRADED").exists():
+            print(f"  !! {c['dir'].name}: {(c['dir'] / 'DEGRADED').read_text().strip()}",
+                  file=sys.stderr)
+            print("     Its latency statistics are NOT comparable with the other points.",
+                  file=sys.stderr)
+
+    modes = {c["qos"] for c in cases}
+    if len(modes) < 2:
+        print(f"  ! only one QoS mode present ({', '.join(sorted(modes))}); "
+              "the baseline-vs-802.1p comparison cannot be made from this run",
+              file=sys.stderr)
+
     rows = [summarise(c) for c in cases]
     summary = pd.DataFrame(rows).sort_values(["qos_mode", "background_load_pct"])
     summary.insert(0, "data_source", "SYNTHETIC_FIXTURE" if SYNTHETIC else "measured")
-    summary.to_csv(root / "summary.csv", index=False)
+    try:
+        summary.to_csv(root / "summary.csv", index=False)
+    except PermissionError:
+        print(f"\ncannot write into {root} - the run directory is not writable by you.\n"
+              "The campaign runs under sudo, so an older run directory is owned by root.\n"
+              f"Fix it with:\n    sudo chown -R \"$USER:$USER\" {root}\n"
+              "Newer runs hand ownership back automatically.", file=sys.stderr)
+        return 1
 
     figures = root / "figures"
     figures.mkdir(exist_ok=True)
