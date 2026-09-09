@@ -513,7 +513,12 @@ forward priority-tagged VID-0 frames.
    frame. The concern that motivated open items #5 and #9 does not apply below
    20 kfps here; re-measure if the kernel or NIC changes.
 2. Whether `igc` accepts `HWTSTAMP_FILTER_ALL`, and whether the
-   ptp4l-narrows/`tsn_rx`-widens ordering holds in practice.
+   ptp4l-narrows/`tsn_rx`-widens ordering holds in practice. **Partly
+   answered.** `ethtool -T enp1s0` on the target hardware lists exactly two RX
+   filter modes, `none` and `all` — so the driver *advertises* the filter this
+   design needs. That it is advertised is not proof the `SIOCSHWTSTAMP` call
+   succeeds under a running ptp4l, nor that the ordering constraint holds; both
+   are still only confirmed by `ts_src=hw` in an actual run (gate D).
 3. Whether the KSwitch ports forward priority-tagged VID-0 frames.
 4. Whether the KSwitch applies **strict priority** on PCP by default. If it does
    not, 802.1p will show no improvement — a finding about the switch, not a bug.

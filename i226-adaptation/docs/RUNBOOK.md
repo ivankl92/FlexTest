@@ -127,19 +127,29 @@ To pick up later changes: `git -C /home/ivank/tsn-testbed pull`. If you have edi
 overwrite local changes.
 
 **Verify:** `/home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists
-and is executable (`ls -l` shows `x` bits):
+and is executable:
+
+```bash
+ls -l /home/ivank/tsn-testbed/i226-adaptation/scripts/*.sh
+```
+
+The scripts are committed mode `100755`, so a `git clone` on Linux already
+produces them executable — **do not run `chmod +x` as a matter of course.** A
+manual `chmod` turns the mode into an uncommitted local change, and the next
+`git pull` then aborts with *"Your local changes to the following files would be
+overwritten by merge"* (§12).
+
+Only if the `x` bits really are missing — which happens when the tree passed
+through a filesystem that cannot store them (a Windows checkout, a cloud-sync
+folder, an unzipped archive) — restore them:
 
 ```bash
 chmod +x /home/ivank/tsn-testbed/i226-adaptation/scripts/*.sh
 ```
 
-Run that once after cloning. If a script is not executable, `sudo ./script.sh`
-fails with **`command not found`** — which reads like a missing file but means a
-missing `x` bit. The bit is stored in the repository, so a plain `git clone` on
-Linux preserves it; it is lost when the tree passes through a filesystem that
-cannot represent it (a Windows checkout, a cloud-sync folder, an unzipped
-archive). `python3 analysis/*.py` is unaffected — those are run through the
-interpreter.
+Without the bit, `sudo ./script.sh` fails with **`command not found`**, which
+reads like a missing file but is a missing `x` bit. `python3 analysis/*.py` is
+unaffected — those run through the interpreter.
 
 ### 4.1 Do you need the upstream repository?
 
@@ -267,7 +277,11 @@ ethtool -T enp1s0
 ```
 
 Require: both links `UP`, correct addresses, and `ethtool -T` listing
-`hardware-transmit`, `hardware-receive`, and `HWTSTAMP_FILTER_ALL`.
+`hardware-transmit` and `hardware-receive` under **Capabilities**, plus `all`
+under **Hardware Receive Filter Modes**. Depending on ethtool version that last
+one prints either as a bare `all` or as `all (HWTSTAMP_FILTER_ALL)` — both mean
+the same thing. On I226/`igc` the expected filter list is just `none` and
+`all`.
 
 **Gate B — gPTP lock** (both PCs, sustained ~30 s)
 
@@ -540,6 +554,7 @@ indexed by priority, and its value is the traffic class.
 | Background traffic appears on the measurement port | Strict ARP settings lost (e.g. after reboot) | Re-run `setup_node.sh`; see §5.4 |
 | `run_measurement.sh`: "passwordless ssh does not work" | Bootstrap not run, or run as the wrong user | Re-run `bootstrap_ssh.sh` under `sudo` — root's key is the one used |
 | `sudo ./<script>.sh` → `command not found`, but the file is there | The script has no executable bit — `sudo` reports it this way rather than "permission denied" | `chmod +x scripts/*.sh` (§4). One-off alternative: `sudo bash ./<script>.sh` |
+| `git pull` → "Your local changes to the following files would be overwritten by merge", listing the scripts | A manual `chmod +x` counts as a local modification, because git tracks the executable bit. Nothing in the file content differs | Confirm it is mode-only — `git diff -- i226-adaptation/scripts/` shows just `old mode`/`new mode` lines and no content hunks — then `git checkout -- i226-adaptation/scripts/ && git pull`. The scripts arrive executable from the repository |
 
 ---
 

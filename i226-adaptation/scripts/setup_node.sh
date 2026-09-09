@@ -75,9 +75,23 @@ ethtool -T "$STREAM_IF" | sed 's/^/    /'
 if ! ethtool -T "$STREAM_IF" | grep -q "hardware-transmit"; then
   die "$STREAM_IF does not report hardware-transmit timestamping - measurement impossible"
 fi
-if ! ethtool -T "$STREAM_IF" | grep -q "HWTSTAMP_FILTER_ALL"; then
-  warn "$STREAM_IF does not advertise HWTSTAMP_FILTER_ALL; RX hardware timestamps"
-  warn "for non-PTP frames may be unavailable. The measurement tools will report this."
+# The RX filter list must offer "all" (HWTSTAMP_FILTER_ALL) — the PTP-only
+# filters would not timestamp our 0x88B5 frames.
+#
+# ethtool prints this section in two different spellings depending on version:
+#
+#     Hardware Receive Filter Modes:        Hardware Receive Filter Modes:
+#         none                                  none        (HWTSTAMP_FILTER_NONE)
+#         all                                   all         (HWTSTAMP_FILTER_ALL)
+#
+# Matching only the symbolic name misses the short form and warns on hardware
+# that is in fact fine. Read the filter section and look for a bare "all".
+if ! ethtool -T "$STREAM_IF" |
+     sed -n '/Hardware Receive Filter Modes:/,$p' |
+     grep -qE '^[[:space:]]*(all|HWTSTAMP_FILTER_ALL)\b'; then
+  warn "$STREAM_IF does not advertise the 'all' RX filter (HWTSTAMP_FILTER_ALL);"
+  warn "RX hardware timestamps for non-PTP frames may be unavailable."
+  warn "The measurement tools will report ts_src=sw if that turns out to be so."
 fi
 
 # ---------------------------------------------------------------------------

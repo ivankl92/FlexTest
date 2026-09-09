@@ -195,13 +195,19 @@ confidence intervals (#2), TAS (#12) or realistic traffic profiles (#15).
 git clone https://github.com/ivankl92/tsn-testbed.git /home/ivank/tsn-upstream
 ```
 
-Make the scripts executable — a clone that came through a Windows checkout or a
-cloud-sync folder loses the bit, and `sudo ./script.sh` then fails with
-`command not found`, which looks like a missing file but is not:
+The scripts are committed mode `100755`, so a Linux clone has them executable
+already. Check rather than assume — and do **not** `chmod +x` reflexively: git
+tracks the bit, so a manual chmod becomes an uncommitted local change and the
+next `git pull` aborts.
 
 ```bash
-chmod +x /home/ivank/tsn-testbed/i226-adaptation/scripts/*.sh
+ls -l /home/ivank/tsn-testbed/i226-adaptation/scripts/*.sh
+# only if the x bits are absent (tree came via Windows / cloud sync / a zip):
+#   chmod +x /home/ivank/tsn-testbed/i226-adaptation/scripts/*.sh
 ```
+
+Without the bit, `sudo ./script.sh` fails with `command not found`, which looks
+like a missing file but is not.
 
 **Gate:** `/home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists
 and `ls -l` shows it executable.
