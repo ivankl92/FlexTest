@@ -85,7 +85,7 @@ you set them is per the Kontron KSwitch D10 documentation (web UI or CLI).
 | # | Requirement | Why | How to verify |
 |---|---|---|---|
 | 1 | **gPTP (802.1AS) enabled** on all four access ports and the inter-switch link | The PCs' PHCs must share a time base or latency is meaningless | §6 gate B: `portState` SLAVE/CLIENT on both PCs |
-| 2 | **One switch is grandmaster**, both PCs are clients | The PCs are configured `clientOnly` and will never win the BMCA | If a PC shows `portState MASTER`, it is not hearing the switch |
+| 2 | **A grandmaster exists in the domain**, and both PCs are clients | The PCs are configured `gmCapable 0` and will never win the BMCA. The GM may be a KSwitch or any other 802.1AS device the switches relay from — it does not matter which | If a PC shows `portState MASTER`, it is not hearing the network |
 | 3 | **Priority-tagged frames (VID 0) accepted and forwarded** on the four access ports | The measured stream carries its PCP in an 802.1Q tag with VID 0 | §6 gate C: the preflight in `run_measurement.sh` |
 | 4 | **PCP → traffic class mapping active, with strict priority** on the egress queue of the inter-switch link | This is what makes 802.1p do anything. PCP 6 must land in a higher-priority queue than PCP 0 | If absent, the 802.1p run will look identical to the baseline |
 
@@ -126,7 +126,20 @@ To pick up later changes: `git -C /home/ivank/tsn-testbed pull`. If you have edi
 `config.conf` in place, commit or stash it first — `pull` will refuse to
 overwrite local changes.
 
-**Verify:** `/home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists.
+**Verify:** `/home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists
+and is executable (`ls -l` shows `x` bits):
+
+```bash
+chmod +x /home/ivank/tsn-testbed/i226-adaptation/scripts/*.sh
+```
+
+Run that once after cloning. If a script is not executable, `sudo ./script.sh`
+fails with **`command not found`** — which reads like a missing file but means a
+missing `x` bit. The bit is stored in the repository, so a plain `git clone` on
+Linux preserves it; it is lost when the tree passes through a filesystem that
+cannot represent it (a Windows checkout, a cloud-sync folder, an unzipped
+archive). `python3 analysis/*.py` is unaffected — those are run through the
+interpreter.
 
 ### 4.1 Do you need the upstream repository?
 
@@ -215,7 +228,9 @@ sudo /home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh \
 The script is idempotent — re-run it freely. `--no-ip-config` skips address
 assignment if your addresses are managed elsewhere.
 
-**Exit codes:** `0` success (prints `gPTP LOCKED`); `4` no gPTP lock within 90 s
+**Exit codes:** `0` success (prints `gPTP LOCKED`); `5` ptp4l rejected the
+generated `/etc/linuxptp/gPTP.cfg` (its own message is printed — fix the config
+before anything else); `4` no gPTP lock within 90 s
 (prints `pmc` state and the last 20 ptp4l journal lines).
 
 ### 5.4 What setup changes on each machine
@@ -511,7 +526,9 @@ indexed by priority, and its value is the traffic class.
 | Symptom | Likely cause | Action |
 |---|---|---|
 | `setup_node.sh` exits 4, no gPTP lock | gPTP off on that switch port; wrong port; profile mismatch | Check switch config; `journalctl -u ptp4l@enp1s0 -n 50`; if the switch uses a different sync interval, adjust `logSyncInterval` in `/etc/linuxptp/gPTP.cfg` |
-| `portState MASTER` on a PC | PC is not hearing the switch at all | gPTP disabled on that port, or cable in the wrong port. The profile already forces `clientOnly` with worst-case priorities |
+| `portState MASTER` on a PC | PC is not hearing the network at all | gPTP disabled on that port, or cable in the wrong port. The profile already forces `gmCapable 0` |
+| No lock, and `journalctl -u ptp4l@enp1s0` shows `Cannot mix 1588 clientOnly with 802.1AS !gmCapable` / `failed to create a clock` | The profile sets both `gmCapable 0` and `clientOnly`/`slaveOnly`. ptp4l refuses that pair and exits 255; `Restart=always` turns it into a crash loop, so the visible symptom is "no gPTP lock" rather than a config error | Delete the `clientOnly`/`slaveOnly` line from `/etc/linuxptp/gPTP.cfg` — `gmCapable 0` alone is the 802.1AS way to say "never grandmaster". Then `systemctl reset-failed ptp4l@enp1s0 && systemctl restart ptp4l@enp1s0` |
+| `ptp4l@…: Start request repeated too quickly` | systemd's restart limit tripped after repeated crashes; it will not retry even once the cause is fixed | `sudo systemctl reset-failed ptp4l@enp1s0` before restarting |
 | Preflight: "tagged frames do not pass but untagged do" | KSwitch ports drop VLAN-tagged frames | Permit priority-tagged (VID 0) frames, or configure a real VLAN and set `STREAM_VID`. **Do not** switch to untagged |
 | Preflight: no frames arrive at all | Cabling, link down, or switch not forwarding | Check `ip -br link`, switch MAC table, and that both ends use the same port pair |
 | `ts_src` shows `sw` | Hardware timestamping unavailable or filter reverted | `ethtool -T enp1s0`; ensure ptp4l started **before** `tsn_rx` — ptp4l narrows the RX filter to PTP and `tsn_rx` widens it back to ALL. A ptp4l restart mid-run re-narrows it |
@@ -522,6 +539,7 @@ indexed by priority, and its value is the traffic class.
 | Points skipped with `ERROR` | gPTP lost during the run | Check sync stability; look for switch topology changes or link flaps |
 | Background traffic appears on the measurement port | Strict ARP settings lost (e.g. after reboot) | Re-run `setup_node.sh`; see §5.4 |
 | `run_measurement.sh`: "passwordless ssh does not work" | Bootstrap not run, or run as the wrong user | Re-run `bootstrap_ssh.sh` under `sudo` — root's key is the one used |
+| `sudo ./<script>.sh` → `command not found`, but the file is there | The script has no executable bit — `sudo` reports it this way rather than "permission denied" | `chmod +x scripts/*.sh` (§4). One-off alternative: `sudo bash ./<script>.sh` |
 
 ---
 

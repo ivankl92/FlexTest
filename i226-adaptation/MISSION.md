@@ -195,7 +195,16 @@ confidence intervals (#2), TAS (#12) or realistic traffic profiles (#15).
 git clone https://github.com/ivankl92/tsn-testbed.git /home/ivank/tsn-upstream
 ```
 
-**Gate:** `/home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists.
+Make the scripts executable — a clone that came through a Windows checkout or a
+cloud-sync folder loses the bit, and `sudo ./script.sh` then fails with
+`command not found`, which looks like a missing file but is not:
+
+```bash
+chmod +x /home/ivank/tsn-testbed/i226-adaptation/scripts/*.sh
+```
+
+**Gate:** `/home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists
+and `ls -l` shows it executable.
 
 ### Step 2 — Passwordless ssh and sudo to PC 2
 
@@ -309,8 +318,20 @@ Confirm the profile matches: 802.1AS uses L2 transport, P2P delay mechanism,
 adjust `logSyncInterval` in `/etc/linuxptp/gPTP.cfg`.
 
 **`portState` is `MASTER` on a PC.** The PC won the BMCA, so it is not hearing
-the switch. Either gPTP is off on that port or the cable is in the wrong port.
-The profile already sets `clientOnly`/`slaveOnly` with worst-case priorities.
+the network. Either gPTP is off on that port or the cable is in the wrong port.
+The profile already sets `gmCapable 0`, which forces priority1 and clockClass
+to 255.
+
+**No gPTP lock, and `journalctl -u ptp4l@enp1s0` shows `Cannot mix 1588
+clientOnly with 802.1AS !gmCapable` followed by `failed to create a clock`.**
+The profile sets `gmCapable 0` *and* `clientOnly`/`slaveOnly`. ptp4l refuses
+that pair and exits 255 before opening the interface; `Restart=always` turns it
+into a crash loop, so what you see is "no lock", not a config error. Remove the
+`clientOnly`/`slaveOnly` line from `/etc/linuxptp/gPTP.cfg` — in an 802.1AS
+profile `gmCapable 0` alone is how a node declares it will never be
+grandmaster. Then `systemctl reset-failed ptp4l@enp1s0 && systemctl restart
+ptp4l@enp1s0` (the reset-failed is required: systemd's restart limit trips and
+it will not retry otherwise).
 
 **Preflight says tagged frames do not pass but untagged do.** The KSwitch ports
 are dropping VLAN-tagged frames. Either permit priority-tagged frames (VID 0) on

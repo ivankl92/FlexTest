@@ -111,11 +111,21 @@ mkdir -p /etc/linuxptp
 cat >/etc/linuxptp/gPTP.cfg <<'EOF'
 #
 # 802.1AS / gPTP profile for TSN-FlexTest on Intel I226 (igc).
-# The Kontron KSwitch D10 switches are the grandmaster, so the PCs are
-# client-only and never advertise themselves as GM.
+#
+# The PCs must never become grandmaster. In an 802.1AS profile that is
+# expressed by 'gmCapable 0' ALONE. Do NOT also set 'clientOnly' (or
+# 'slaveOnly'): those are the IEEE 1588 default-profile mechanism, and ptp4l
+# rejects the combination outright at startup with
+#     Cannot mix 1588 clientOnly with 802.1AS !gmCapable
+#     failed to create a clock
+# which systemd then turns into a restart loop. 'gmCapable 0' already forces
+# priority1 and clockClass to 255, so the node loses every BMCA comparison.
+#
+# The grandmaster does not have to be a KSwitch. The switches may simply relay
+# time from a GM elsewhere in the network; all this profile requires is that
+# the PC is a client of whatever GM the domain has.
 #
 [global]
-clientOnly              1
 gmCapable               0
 priority1               255
 priority2               255
@@ -139,12 +149,13 @@ step_threshold          0.00002
 summary_interval        4
 EOF
 
-# linuxptp < 4.0 does not know 'clientOnly'; fall back to 'slaveOnly'.
+# Fail fast on a config ptp4l will not accept, instead of handing systemd a
+# unit that crash-loops. ptp4l validates the file and exits before touching the
+# interface when given -h.
 if ! ptp4l -f /etc/linuxptp/gPTP.cfg -i "$STREAM_IF" -h >/dev/null 2>&1; then
-  if ptp4l -v 2>&1 | grep -qE '^ptp4l 3\.'; then
-    log "  linuxptp 3.x detected - using 'slaveOnly' instead of 'clientOnly'"
-    sed -i 's/^clientOnly /slaveOnly   /' /etc/linuxptp/gPTP.cfg
-  fi
+  log "  ERROR: ptp4l rejects /etc/linuxptp/gPTP.cfg. Its own message:"
+  ptp4l -f /etc/linuxptp/gPTP.cfg -i "$STREAM_IF" -h 2>&1 | sed 's/^/    /' | tail -5
+  exit 5
 fi
 
 cat >/etc/systemd/system/ptp4l@.service <<EOF

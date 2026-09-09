@@ -247,15 +247,34 @@ Decisions embedded here:
 
 `/etc/linuxptp/gPTP.cfg` is written from scratch as an 802.1AS profile:
 `network_transport L2`, `delay_mechanism P2P`, `transportSpecific 0x1`,
-`ptp_dst_mac 01:80:C2:00:00:0E`, `logSyncInterval -3`, `clientOnly 1`,
+`ptp_dst_mac 01:80:C2:00:00:0E`, `logSyncInterval -3`, `gmCapable 0`,
 `priority1/2 = 255`.
 
-`clientOnly` with worst-case priorities is deliberate: it guarantees the PCs
-lose the BMCA and never become grandmaster. If a PC nonetheless reports
-`portState MASTER`, that is unambiguous evidence it cannot hear the switch —
-a useful, non-ambiguous diagnostic rather than a silent misconfiguration.
-The script falls back to `slaveOnly` on linuxptp 3.x, which predates
-`clientOnly`.
+`gmCapable 0` guarantees the PCs lose the BMCA and never become grandmaster: it
+forces `priority1` and `clockClass` to 255 internally. If a PC nonetheless
+reports `portState MASTER`, that is unambiguous evidence it cannot hear the
+network — a useful diagnostic rather than a silent misconfiguration.
+
+**`gmCapable 0` must appear alone.** The first version of this profile also set
+`clientOnly 1`, on the reasoning that saying it twice could not hurt. It can:
+`clientOnly`/`slaveOnly` are the IEEE 1588 default-profile mechanism, and ptp4l
+refuses the combination at startup —
+
+```
+Cannot mix 1588 clientOnly with 802.1AS !gmCapable
+failed to create a clock
+```
+
+— exiting 255 before it ever opens the interface. With `Restart=always` on the
+systemd unit, that becomes a crash loop, and the symptom the operator sees is
+not a config error but "no gPTP lock within 90 s", because `pmc` has no running
+`ptp4l` to answer it. The setup script now validates the file with
+`ptp4l -f … -h` and exits 5 with ptp4l's own message rather than installing a
+unit that cannot start.
+
+The grandmaster need not be one of the KSwitches. They may relay time from a GM
+elsewhere in the network; this profile only requires that the PC is a client of
+whatever GM the domain has.
 
 ### 3.7 System-level decisions
 
