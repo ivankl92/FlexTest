@@ -214,11 +214,21 @@ for QOS in $QOS_MODES; do
     # 4. collect
     scp -q -o BatchMode=yes "${PC2}:/tmp/rx_${LABEL}.csv" "${CASE_DIR}/rx.csv" || \
       warn "  could not fetch rx.csv"
-    $RSH "$PC2" "rm -f /tmp/rx_${LABEL}.csv" || true
+    # tsn_rx ran under sudo, so /tmp/rx_*.csv on PC 2 is owned by root. /tmp is
+    # sticky, so the unprivileged ssh user cannot unlink another user's file
+    # there and plain `rm` fails with EPERM ("Operation not permitted"). Remove
+    # it with the same privilege that created it.
+    $RSH "$PC2" "sudo rm -f /tmp/rx_${LABEL}.csv" || true
 
     check_ptp || true
+    # TXN/RXN count CSV rows, i.e. recovered timestamps — NOT frames sent.
+    # SENT is what tsn_tx actually put on the wire, read back from its own
+    # report. Loss must be measured against SENT: dividing by TXN makes a
+    # missing TX timestamp look like a negative loss.
     TXN=$(( $(wc -l < "${CASE_DIR}/tx.csv" 2>/dev/null || echo 1) - 1 ))
     RXN=$(( $(wc -l < "${CASE_DIR}/rx.csv" 2>/dev/null || echo 1) - 1 ))
+    SENT=$(grep -o 'sent=[0-9]*' "${CASE_DIR}/tx.log" 2>/dev/null | head -1 | cut -d= -f2)
+    SENT=${SENT:-0}
 
     cat > "${CASE_DIR}/meta.json" <<EOF
 {
@@ -234,13 +244,24 @@ for QOS in $QOS_MODES; do
   "stream_rate_pps": ${STREAM_RATE},
   "stream_frame_bytes": ${STREAM_SIZE},
   "stream_duration_s": ${STREAM_DURATION},
+  "frames_sent": ${SENT},
   "tx_timestamps": ${TXN},
   "rx_timestamps": ${RXN},
   "ptp_before": "${PTP_BEFORE}",
   "ptp_after": "${PTP_LAST}"
 }
 EOF
-    log "  tx=${TXN} rx=${RXN}"
+    # Report the three numbers separately so a shortfall in TX-timestamp yield
+    # cannot be mistaken for frame loss (or hidden by it). "rx greater than
+    # tx_ts" is not a paradox: some frames went out and arrived while their TX
+    # timestamp was never retrieved.
+    if (( SENT > 0 )); then
+      YIELD=$(LC_ALL=C awk -v a="$TXN" -v b="$SENT" 'BEGIN{printf "%.2f", 100*a/b}')
+      LOSS=$(LC_ALL=C awk -v a="$RXN" -v b="$SENT" 'BEGIN{printf "%.3f", 100*(1-a/b)}')
+      log "  sent=${SENT} tx_ts=${TXN} (${YIELD}% yield) rx=${RXN} (${LOSS}% loss)"
+    else
+      log "  tx_ts=${TXN} rx=${RXN}"
+    fi
     (( RXN < 1 )) && warn "  no frames received for $LABEL"
 
     sleep 5   # cool down, matches the original testbed's inter-run pause

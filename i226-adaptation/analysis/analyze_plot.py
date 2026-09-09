@@ -156,7 +156,14 @@ def load_case(case_dir: Path) -> dict | None:
         "meta": meta,
         "qos": meta.get("qos_mode", case_dir.name.split("_")[0]),
         "load": int(meta.get("background_load_percent", case_dir.name.split("load")[-1] or 0)),
+        # len(tx) is the number of recovered TX timestamps, not the number of
+        # frames sent. They differ whenever the NIC does not return a timestamp
+        # for every frame, and using the former as the loss denominator can
+        # produce a negative loss. tsn_tx's own count is carried in meta.json
+        # as frames_sent; fall back to the timestamp count only for older runs
+        # that predate that field.
         "tx_n": len(tx),
+        "sent_n": int(meta.get("frames_sent") or 0) or len(tx),
         "rx_n": len(rx),
         "matched": len(df),
         "latency_us": df["latency_ns"].to_numpy() / 1000.0,
@@ -168,12 +175,15 @@ def load_case(case_dir: Path) -> dict | None:
 def summarise(case: dict) -> dict:
     lat = case["latency_us"]
     ipdv = np.diff(lat) if len(lat) > 1 else np.array([0.0])
-    loss = 100.0 * (1.0 - case["rx_n"] / case["tx_n"]) if case["tx_n"] else float("nan")
+    sent = case["sent_n"]
+    loss = 100.0 * (1.0 - case["rx_n"] / sent) if sent else float("nan")
     return {
         "qos_mode": case["qos"],
         "series": SERIES.get(case["qos"], {}).get("label", case["qos"]),
         "background_load_pct": case["load"],
-        "frames_sent": case["tx_n"],
+        "frames_sent": sent,
+        "tx_timestamps": case["tx_n"],
+        "tx_ts_yield_pct": round(100.0 * case["tx_n"] / sent, 4) if sent else float("nan"),
         "frames_received": case["rx_n"],
         "frames_matched": case["matched"],
         "loss_pct": round(loss, 4),
@@ -418,6 +428,7 @@ def main() -> int:
 
     # markdown summary, easy to paste into a report
     cols = ["series", "background_load_pct", "frames_sent", "frames_received", "loss_pct",
+            "tx_ts_yield_pct",
             "lat_median_us", "lat_p99_us", "lat_max_us", "lat_std_us"]
     title = ("# TSN-FlexTest (I226 adaptation) - SYNTHETIC FIXTURE, NOT MEASURED DATA"
              if SYNTHETIC else

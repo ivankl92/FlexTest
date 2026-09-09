@@ -88,16 +88,22 @@ appears as a constant bias, not as jitter.
 
 ## Status
 
-**The measurement path has never been run end to end.** No campaign has been
-executed and no latency has been measured. `i226-adaptation/docs/REPORT.md` §8
-states precisely what has and has not been exercised — read it before trusting
-any output.
+**The measurement path runs end to end on real hardware** as of 2026-09-09. A
+`--quick` smoke campaign across two KSwitch D10 switches produced 4 points ×
+100 000 frames at 10 000 fps, with a **hardware** timestamp on both ends of
+every recorded frame (`ts_src=hw` throughout) and gPTP held within ±8 ns
+before and after each point.
 
-One component has been validated on the target hardware: `tx_rate_selftest.sh`
-returned **100 % hardware TX timestamp yield from 200 to 20 000 fps** with zero
-skipped frames (kernel `6.8.1-1058-realtime`, `igc`, 512 B frames). A 100 µs
-period with a timestamp on every frame is therefore supported, and
-`STREAM_RATE` defaults to 10000.
+**That validates the mechanism, not the experiment.** No full campaign has been
+run and no latency figure has been analysed or interpreted yet. Whether IEEE
+802.1p actually changes anything on this hardware is still an open question —
+it depends on the switches applying strict priority on PCP, which is unverified.
+`i226-adaptation/docs/REPORT.md` §8 states exactly what has and has not been
+exercised; read it before trusting any output.
+
+`tx_rate_selftest.sh` separately returned **100 % hardware TX timestamp yield
+from 200 to 20 000 fps** (kernel `6.8.1-1058-realtime`, `igc`, 512 B frames), so
+a 100 µs period is supported and `STREAM_RATE` defaults to 10000.
 
 `analysis/make_fixture.py` generates fabricated data for testing the analysis
 code. It writes a `SYNTHETIC` marker that causes every figure to be watermarked

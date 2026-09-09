@@ -7,10 +7,11 @@ how to change the topology or targets, troubleshooting, and teardown.
 For *why* it is built this way, see `REPORT.md`. For the autonomous-agent
 version of the setup sequence, see `../MISSION.md`.
 
-> **Before the first campaign, read §6 (verification gates).** Several
-> assumptions in this design have never been tested on real hardware. The gates
-> exist to catch them; skipping them produces plausible numbers that mean
-> nothing.
+> **Before the first campaign, read §6 (verification gates).** The measurement
+> path has now been validated end to end on the reference testbed, but the gates
+> still matter on every setup and after every reboot — hardware timestamping,
+> gPTP lock and tagged-frame forwarding can all fail silently, and skipping the
+> gates produces plausible numbers that mean nothing.
 
 ---
 

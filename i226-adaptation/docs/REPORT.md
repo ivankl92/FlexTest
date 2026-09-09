@@ -4,12 +4,13 @@
 (`github.com/ivankl92/tsn-testbed`) to two UP Squared Pro 7000 Edge PCs with
 Intel I226-IT NICs and two Kontron KSwitch D10 switches.
 
-**Status:** implementation complete. The **measurement path has never been run
-end to end** across the real testbed — no campaign has been executed, no latency
-has been measured. One component *has* now run on the target hardware: the TX
-timestamp self-test (§8), which resolved what had been the highest-ranked
-unknown. Section 8 states precisely what has and has not been exercised. Read it
-before trusting anything here.
+**Status:** implementation complete, and the **measurement path has now run end
+to end on the real testbed** (2026-09-09, run `20260909-160453`): a `--quick`
+smoke campaign of 4 points × 100 000 frames, every frame timestamped in
+hardware on both ends, gPTP held within ±8 ns throughout. That validates the
+mechanism. It is **not** a result: no full campaign has been run, and no latency
+figures have been analysed or interpreted yet. Section 8 states precisely what
+has and has not been exercised. Read it before trusting anything here.
 
 ---
 
@@ -495,14 +496,31 @@ frame copy, pacing and CSV format. `analyze_plot.py` ran against the fixture and
 rendered all five figures, and the watermark interlock was verified in both
 directions. Shell scripts pass `bash -n` and `shellcheck -S error`.
 
-**Never executed anywhere.** The hardware timestamping path itself. `veth` has
-no PHC — `SIOCSHWTSTAMP` returns `EOPNOTSUPP` — so that run used the `-S`
-software fallback and never touched `HWTSTAMP_FILTER_ALL` or `ts[2]`. Also
-untested: every script at runtime (apt, systemd units, `pmc` output parsing,
-ssh/scp, iperf3, `mqprio` on `igc`), gPTP lock, and whether the KSwitches
-forward priority-tagged VID-0 frames.
+**Exercised on the real testbed** (run `20260909-160453`, `--quick`: 2 QoS modes
+× 2 loads × 10 s at 10 000 fps). This supersedes the `veth` caveat above — the
+hardware timestamping path itself now runs. Specifically confirmed:
 
-**Ranked unknowns.** (#1 has since been measured — see below.)
+- `SIOCSHWTSTAMP` with `HWTSTAMP_FILTER_ALL` succeeds on `igc`, **while ptp4l is
+  running**, and the filter stays wide: `ts_src` is `hw` in every row of every
+  `tx.csv` and `rx.csv` across all four points. The ptp4l-narrows /
+  `tsn_rx`-widens ordering therefore holds in practice.
+- Hardware TX-timestamp yield under real load: 100 000/100 000 at 0 % load in
+  both QoS modes; 99 998 and 99 993 out of 100 000 at 95 % load.
+- gPTP lock sustained on both PCs before and after every point, offsets between
+  −7 and +8 ns, including under 950 Mbit/s of background traffic.
+- Every script at runtime: apt, the systemd units, `pmc` parsing, ssh/scp,
+  iperf3, and `mqprio` on `igc`.
+- The KSwitches forward priority-tagged VID-0 frames (preflight 200/200).
+
+**Still never executed.** A full campaign (`BG_LOADS="0 50 80 95 105"`,
+30 s per point). No latency figure from this testbed has been analysed,
+plotted or interpreted — `analyze_plot.py` has still only ever run against the
+synthetic fixture. Nothing here says whether 802.1p makes a measurable
+difference on this hardware; that is what the full campaign is for.
+
+**Ranked unknowns.** #1, #2 and #3 are now answered on the real hardware. #4 and
+#5 remain open — and #4 is the one that determines whether the experiment has
+anything to show.
 
 1. ~~**I226 TX-timestamp yield.**~~ **MEASURED — not a limitation on this
    hardware.** `tx_rate_selftest.sh` on the target PC (kernel
@@ -512,14 +530,18 @@ forward priority-tagged VID-0 frames.
    can be raised to 10 000 fps (100 µs period) with a hardware timestamp on every
    frame. The concern that motivated open items #5 and #9 does not apply below
    20 kfps here; re-measure if the kernel or NIC changes.
-2. Whether `igc` accepts `HWTSTAMP_FILTER_ALL`, and whether the
-   ptp4l-narrows/`tsn_rx`-widens ordering holds in practice. **Partly
-   answered.** `ethtool -T enp1s0` on the target hardware lists exactly two RX
-   filter modes, `none` and `all` — so the driver *advertises* the filter this
-   design needs. That it is advertised is not proof the `SIOCSHWTSTAMP` call
-   succeeds under a running ptp4l, nor that the ordering constraint holds; both
-   are still only confirmed by `ts_src=hw` in an actual run (gate D).
-3. Whether the KSwitch ports forward priority-tagged VID-0 frames.
+2. ~~Whether `igc` accepts `HWTSTAMP_FILTER_ALL`, and whether the
+   ptp4l-narrows/`tsn_rx`-widens ordering holds in practice.~~ **ANSWERED —
+   both hold.** `ethtool -T` advertises exactly `none` and `all`, and run
+   `20260909-160453` confirms the filter is actually applied and stays applied:
+   `ts_src` is `hw` in every row of all eight CSVs, with ptp4l running
+   throughout. The ordering constraint is real but satisfied by the documented
+   start order; nothing silently reverted to PTP-only.
+3. ~~Whether the KSwitch ports forward priority-tagged VID-0 frames.~~
+   **ANSWERED — they do.** The preflight in the first end-to-end run received
+   **200 / 200** priority-tagged frames PC 1 → PC 2, so no VLAN configuration
+   is needed on the access ports and the PCP-0-vs-PCP-6 comparison is viable
+   as designed.
 4. Whether the KSwitch applies **strict priority** on PCP by default. If it does
    not, 802.1p will show no improvement — a finding about the switch, not a bug.
 5. `pmc` output-format assumptions across linuxptp versions.
