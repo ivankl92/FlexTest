@@ -1,12 +1,11 @@
 Paste this to Claude Code running on PC 1 (172.16.0.91), after
 
-    sudo mkdir -p /home/tsn-testbed && sudo chown "$USER:$USER" /home/tsn-testbed
-    git clone https://github.com/ivankl92/FlexTest.git /home/tsn-testbed
+    git clone https://github.com/ivankl92/FlexTest.git /home/ivank/tsn-testbed
 
-so that MISSION.md sits at /home/tsn-testbed/i226-adaptation/MISSION.md
+so that MISSION.md sits at /home/ivank/tsn-testbed/i226-adaptation/MISSION.md
 ------------------------------------------------------------------------------
 
-Read /home/tsn-testbed/i226-adaptation/MISSION.md and carry out the whole
+Read /home/ivank/tsn-testbed/i226-adaptation/MISSION.md and carry out the whole
 mission described in it, autonomously, from step 1 to step 7.
 
 You are on PC 1 of a two-PC TSN testbed. The mission file has the topology, the

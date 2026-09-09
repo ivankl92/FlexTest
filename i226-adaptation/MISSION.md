@@ -77,7 +77,7 @@ Other decisions:
 - **Baseline is PCP 0, not untagged.** Both configurations send byte-identical
   priority-tagged frames (VID 0); only the PCP differs (0 vs 6). That isolates
   the effect of prioritisation instead of also changing frame length.
-- **Pack location:** `/home/tsn-testbed/i226-adaptation/`. The upstream repo is
+- **Pack location:** `/home/ivank/tsn-testbed/i226-adaptation/`. The upstream repo is
   *not* required to run anything here (see Step 1); if cloned, keep it unmodified
   as a reference for the paper's methodology and the open items.
 - **`chrony`/`systemd-timesyncd` get disabled** by the setup script. They fight
@@ -172,14 +172,15 @@ gate without either fixing it or reporting it.
 ### Step 1 — Get the code onto both PCs
 
 ```bash
-sudo mkdir -p /home/tsn-testbed && sudo chown ivank:ivank /home/tsn-testbed
-git clone https://github.com/ivankl92/FlexTest.git /home/tsn-testbed
-# result: /home/tsn-testbed/i226-adaptation/
+git clone https://github.com/ivankl92/FlexTest.git /home/ivank/tsn-testbed
+# result: /home/ivank/tsn-testbed/i226-adaptation/
 ```
 
-Clone **into** `/home/tsn-testbed`, not under it: the repository root holds
-`i226-adaptation/`, so every path below resolves as written. `git clone` needs
-the target directory empty, which `mkdir -p` leaves it.
+No `sudo`: the tree lives in `ivank`'s home directory and stays owned by
+`ivank`. Clone **into** `/home/ivank/tsn-testbed`, not under it — the repository
+root holds `i226-adaptation/`, so every path below resolves as written, and
+`git clone` creates the directory itself. The path must be identical on both
+PCs, because this machine invokes PC 2's scripts over ssh by absolute path.
 
 **The upstream clone is optional and is NOT a dependency.** No script, tool or
 analysis in this pack reads, imports or executes anything from it — the only
@@ -189,17 +190,17 @@ that use it (see `docs/REPORT.md` §9): the upstream-schema adapter (#1),
 confidence intervals (#2), TAS (#12) or realistic traffic profiles (#15).
 
 ```bash
-# optional, for the open items above. Clone it OUTSIDE /home/tsn-testbed —
+# optional, for the open items above. Clone it OUTSIDE /home/ivank/tsn-testbed —
 # that directory is this repository's working tree.
-git clone https://github.com/ivankl92/tsn-testbed.git /home/tsn-upstream
+git clone https://github.com/ivankl92/tsn-testbed.git /home/ivank/tsn-upstream
 ```
 
-**Gate:** `/home/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists.
+**Gate:** `/home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists.
 
 ### Step 2 — Passwordless ssh and sudo to PC 2
 
 ```bash
-cd /home/tsn-testbed/i226-adaptation/scripts
+cd /home/ivank/tsn-testbed/i226-adaptation/scripts
 sudo ./bootstrap_ssh.sh ivank@172.16.28.17     # prompts for PC 2's password
 ```
 
@@ -212,27 +213,26 @@ prints `OK`.
 ### Step 3 — Copy the pack to PC 2 and set up both nodes
 
 ```bash
-ssh ivank@172.16.28.17 'sudo mkdir -p /home/tsn-testbed && sudo chown ivank:ivank /home/tsn-testbed \
-    && git clone https://github.com/ivankl92/FlexTest.git /home/tsn-testbed'
+ssh ivank@172.16.28.17 'git clone https://github.com/ivankl92/FlexTest.git /home/ivank/tsn-testbed'
 ```
 
 If PC 1 has local changes that are not committed and pushed, copy the tree
 instead so both nodes run identical code:
 
 ```bash
-rsync -a /home/tsn-testbed/i226-adaptation/ ivank@172.16.28.17:/home/tsn-testbed/i226-adaptation/
+rsync -a /home/ivank/tsn-testbed/i226-adaptation/ ivank@172.16.28.17:/home/ivank/tsn-testbed/i226-adaptation/
 ```
 
 On **PC 2** (listener):
 ```bash
-sudo /home/tsn-testbed/i226-adaptation/scripts/setup_node.sh \
+sudo /home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh \
      --stream-if enp1s0 --bg-if enp2s0 \
      --stream-ip 192.168.1.71/24 --bg-ip 192.168.1.72/24 --role listener
 ```
 
 On **PC 1** (talker):
 ```bash
-sudo /home/tsn-testbed/i226-adaptation/scripts/setup_node.sh \
+sudo /home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh \
      --stream-if enp1s0 --bg-if enp2s0 \
      --stream-ip 192.168.1.61/24 --bg-ip 192.168.1.62/24 --role talker
 ```
@@ -258,7 +258,7 @@ ethtool -T enp1s0                        # both PCs
 ### Step 5 — Quick functional run
 
 ```bash
-cd /home/tsn-testbed/i226-adaptation/scripts
+cd /home/ivank/tsn-testbed/i226-adaptation/scripts
 sudo ./run_measurement.sh --quick
 ```
 
@@ -281,8 +281,8 @@ the results directory path on the last line.
 ### Step 7 — Analyse and plot
 
 ```bash
-python3 /home/tsn-testbed/i226-adaptation/analysis/analyze_plot.py \
-        /home/tsn-testbed/i226-adaptation/results/<run-id>
+python3 /home/ivank/tsn-testbed/i226-adaptation/analysis/analyze_plot.py \
+        /home/ivank/tsn-testbed/i226-adaptation/results/<run-id>
 ```
 
 Produces `summary.csv`, `summary.md`, and `figures/` containing:

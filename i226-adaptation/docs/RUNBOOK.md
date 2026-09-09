@@ -106,21 +106,27 @@ left. Instead configure a real VLAN on all five links and set `STREAM_VID` in
 On **PC 1**:
 
 ```bash
-sudo mkdir -p /home/tsn-testbed && sudo chown "$USER:$USER" /home/tsn-testbed
-git clone https://github.com/ivankl92/FlexTest.git /home/tsn-testbed
-# result: /home/tsn-testbed/i226-adaptation/
+git clone https://github.com/ivankl92/FlexTest.git /home/ivank/tsn-testbed
+# result: /home/ivank/tsn-testbed/i226-adaptation/
 ```
 
-Cloning **into** `/home/tsn-testbed` rather than under it is deliberate: the
-repository root holds `i226-adaptation/`, so every path in this runbook —
-`/home/tsn-testbed/i226-adaptation/...` — resolves as written. `git clone`
-requires the target directory to be empty, which `mkdir -p` leaves it.
+No `sudo` — the tree lives in the operating user's home directory and is owned
+by that user throughout. Only the setup and campaign scripts need root.
 
-To pick up later changes: `git -C /home/tsn-testbed pull`. If you have edited
+Cloning **into** `/home/ivank/tsn-testbed` rather than under it is deliberate:
+the repository root holds `i226-adaptation/`, so every path in this runbook —
+`/home/ivank/tsn-testbed/i226-adaptation/...` — resolves as written. `git clone`
+creates the target directory itself.
+
+Substitute your own home directory if the operating user is not `ivank`; the
+path must be **identical on both PCs**, because the campaign driver invokes the
+scripts on PC 2 over ssh by absolute path.
+
+To pick up later changes: `git -C /home/ivank/tsn-testbed pull`. If you have edited
 `config.conf` in place, commit or stash it first — `pull` will refuse to
 overwrite local changes.
 
-**Verify:** `/home/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists.
+**Verify:** `/home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh` exists.
 
 ### 4.1 Do you need the upstream repository?
 
@@ -143,11 +149,11 @@ Clone it when you take on one of these, and not before:
 If so:
 
 ```bash
-git clone https://github.com/ivankl92/tsn-testbed.git /home/tsn-upstream
+git clone https://github.com/ivankl92/tsn-testbed.git /home/ivank/tsn-upstream
 ```
 
 Keep it unmodified — it is a reference, not a component. Clone it outside
-`/home/tsn-testbed`: that directory is now this repository's working tree, and a
+`/home/ivank/tsn-testbed`: that directory is now this repository's working tree, and a
 second clone inside it would show up as untracked files.
 
 ---
@@ -157,7 +163,7 @@ second clone inside it would show up as untracked files.
 ### 5.1 Passwordless ssh and sudo to PC 2
 
 ```bash
-cd /home/tsn-testbed/i226-adaptation/scripts
+cd /home/ivank/tsn-testbed/i226-adaptation/scripts
 sudo ./bootstrap_ssh.sh ivank@172.16.28.17
 ```
 
@@ -177,8 +183,7 @@ sudo ssh -o BatchMode=yes ivank@172.16.28.17 'sudo -n true && echo OK'
 Clone the same repository on PC 2:
 
 ```bash
-ssh ivank@172.16.28.17 'sudo mkdir -p /home/tsn-testbed && sudo chown ivank:ivank /home/tsn-testbed \
-    && git clone https://github.com/ivankl92/FlexTest.git /home/tsn-testbed'
+ssh ivank@172.16.28.17 'git clone https://github.com/ivankl92/FlexTest.git /home/ivank/tsn-testbed'
 ```
 
 If PC 1 carries local changes that are not committed and pushed — an edited
@@ -186,7 +191,7 @@ If PC 1 carries local changes that are not committed and pushed — an edited
 identical code:
 
 ```bash
-rsync -a /home/tsn-testbed/i226-adaptation/ ivank@172.16.28.17:/home/tsn-testbed/i226-adaptation/
+rsync -a /home/ivank/tsn-testbed/i226-adaptation/ ivank@172.16.28.17:/home/ivank/tsn-testbed/i226-adaptation/
 ```
 
 ### 5.3 Run node setup — PC 2 first, then PC 1
@@ -194,7 +199,7 @@ rsync -a /home/tsn-testbed/i226-adaptation/ ivank@172.16.28.17:/home/tsn-testbed
 PC 2 (listener):
 
 ```bash
-sudo /home/tsn-testbed/i226-adaptation/scripts/setup_node.sh \
+sudo /home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh \
      --stream-if enp1s0 --bg-if enp2s0 \
      --stream-ip 192.168.1.71/24 --bg-ip 192.168.1.72/24 --role listener
 ```
@@ -202,7 +207,7 @@ sudo /home/tsn-testbed/i226-adaptation/scripts/setup_node.sh \
 PC 1 (talker):
 
 ```bash
-sudo /home/tsn-testbed/i226-adaptation/scripts/setup_node.sh \
+sudo /home/ivank/tsn-testbed/i226-adaptation/scripts/setup_node.sh \
      --stream-if enp1s0 --bg-if enp2s0 \
      --stream-ip 192.168.1.61/24 --bg-ip 192.168.1.62/24 --role talker
 ```
@@ -268,7 +273,7 @@ ping -c3 -I enp2s0 192.168.1.72
 **Gate D — end-to-end functional run**
 
 ```bash
-cd /home/tsn-testbed/i226-adaptation/scripts
+cd /home/ivank/tsn-testbed/i226-adaptation/scripts
 sudo ./run_measurement.sh --quick        # 2 QoS modes × 2 loads × 10 s
 ```
 
@@ -285,7 +290,7 @@ before raising `STREAM_RATE`)
 The direct test needs one PC only — no switch, no PC 2, no gPTP:
 
 ```bash
-sudo /home/tsn-testbed/i226-adaptation/scripts/tx_rate_selftest.sh enp1s0
+sudo /home/ivank/tsn-testbed/i226-adaptation/scripts/tx_rate_selftest.sh enp1s0
 ```
 
 It sweeps the frame rate, reports the hardware-timestamp yield at each step and
@@ -345,7 +350,7 @@ match — the two are a pair.
 ## 8. Running a measurement
 
 ```bash
-cd /home/tsn-testbed/i226-adaptation/scripts
+cd /home/ivank/tsn-testbed/i226-adaptation/scripts
 sudo ./run_measurement.sh              # full campaign
 sudo ./run_measurement.sh --quick      # smoke test: 2 loads, 10 s each
 sudo ./run_measurement.sh --config /path/to/other.conf
@@ -382,6 +387,12 @@ results/<YYYYmmdd-HHMMSS>/
 └── figures/                         written by analyze_plot.py
 ```
 
+`RESULT_ROOT` sits inside the repository working tree, so run directories appear
+as untracked files in `git status`. The repository's `.gitignore` excludes
+`i226-adaptation/results/` for that reason. The campaign runs under `sudo`, so
+those directories are owned by **root** — `sudo chown -R "$USER:$USER"` the run
+directory if you want to prune or move results without `sudo`.
+
 **CSV schema.** `seq` is the frame's sequence number, the join key.
 `tx_hw_ns` / `rx_hw_ns` are raw PHC nanoseconds from the sending and receiving
 NIC. `sw_tx_ns` is a software `CLOCK_TAI` reading at `send()`, carried for
@@ -398,8 +409,8 @@ grandmaster offset appears as a constant bias, not as jitter.
 ## 10. Evaluation
 
 ```bash
-python3 /home/tsn-testbed/i226-adaptation/analysis/analyze_plot.py \
-        /home/tsn-testbed/i226-adaptation/results/<run-id>
+python3 /home/ivank/tsn-testbed/i226-adaptation/analysis/analyze_plot.py \
+        /home/ivank/tsn-testbed/i226-adaptation/results/<run-id>
 ```
 
 Produces `summary.csv`, `summary.md`, and in `figures/` (PNG + PDF):
