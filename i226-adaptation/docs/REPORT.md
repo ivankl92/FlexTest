@@ -598,15 +598,31 @@ anything to show.
    detecting saturation during preflight and reducing `STREAM_RATE`
    automatically.
 
-10. **Hardware pacing via `SO_TXTIME` + `etf`.** *Now the binding constraint at
-   high rates, not timestamp yield.* `clock_nanosleep` paces in software, so at a
-   100 µs period the scheduler's wakeup jitter is a large fraction of the period
-   even on a realtime kernel. `tx_rate_selftest.sh` reports the actual on-wire
-   inter-frame gap (`GAP SD` / `GAP MAX`) from the hardware TX timestamps, which
-   quantifies this directly. If those numbers are a significant fraction of the
-   period, `igc`'s LaunchTime support (`SO_TXTIME` plus the `etf` qdisc) would
-   move pacing into the NIC and restore a genuinely isochronous stream. Required
-   before describing the stimulus as a true 100 µs periodic stream.
+10. **Hardware pacing via `SO_TXTIME` + `etf`.** *Now the binding constraint —
+   and it is measured, not predicted.* `tx_rate_selftest.sh` on both PCs
+   (kernel `6.8.1-1058-realtime`, idle machines, no background load):
+
+   | Rate | Period | GAP SD | GAP MAX | Worst gap |
+   |---|---|---|---|---|
+   | 1 000 fps | 1000 µs | 28.4 µs (3 %) | 485 µs | 0.5 × period |
+   | 5 000 fps | 200 µs | 25.4 µs (13 %) | 1365 µs | **7 × period** |
+   | 10 000 fps | 100 µs | 24.3 µs (24 %) | 2419 µs | **24 × period** |
+   | 20 000 fps | 50 µs | 11.8 µs (24 %) | 1607 µs | **32 × period** |
+   | 50 000 fps | 20 µs | 10.8 µs (54 %) | 1113 µs | **56 × period** |
+
+   Timestamp yield is 100 % at every one of these rates, so this is invisible
+   in the yield column — the frames are timestamped, they just do not leave on
+   schedule. `GAP MAX` stays around 0.5–2.4 ms regardless of rate, which is the
+   signature of an occasional scheduler preemption rather than a rate-dependent
+   limit: `clock_nanosleep` cannot hold a schedule finer than the wakeup jitter
+   of the machine it runs on, RT kernel or not.
+
+   Consequence for the experiment: per-frame latency stays valid (both
+   timestamps are hardware), but at `STREAM_RATE=10000` **the stimulus is
+   bursty, not a 100 µs CBR stream** — and queueing delay depends on the
+   arrival pattern, so this belongs in the methodology section of any writeup.
+   `igc`'s LaunchTime support (`SO_TXTIME` plus the `etf` qdisc) would move
+   pacing into the NIC. Required before describing the stimulus as periodic.
 11. **Optional pcap capture alongside CSV**, for post-hoc inspection of anomalies.
 
 ### Tier 3 — scientific extensions

@@ -80,6 +80,7 @@ for RATE in $RATES; do
 
   if [[ "$OK" == "1" ]]; then VERDICT="ok"; BEST=$RATE
   else VERDICT="DEGRADED"; fi
+  PERIOD_US=$(awk -v r="$RATE" 'BEGIN{printf "%.3f", 1e6/r}')
 
   # A software-timestamp fallback would invalidate the whole measurement.
   if grep -q ',sw$' "$TMP/tx_${RATE}.csv" 2>/dev/null; then
@@ -101,16 +102,42 @@ for RATE in $RATES; do
       "$TMP/tx_${RATE}.csv" 2>/dev/null || echo "n/a n/a")
   JIT_SD=${JIT%% *}; JIT_MAX=${JIT##* }
 
+  # Worst-case gap error as a multiple of the nominal period. Yield says the
+  # NIC timestamped the frames; this says whether they left on schedule. They
+  # are independent, and only the pair together describes the stimulus.
+  if [[ "$JIT_MAX" != "n/a" ]]; then
+    GAPX=$(LC_ALL=C awk -v m="$JIT_MAX" -v p="$PERIOD_US" 'BEGIN{printf "%.0f", m/p}')
+    if [[ "$VERDICT" == "ok" ]] && (( GAPX >= 2 )); then
+      VERDICT="ok / gap x${GAPX}"
+      [[ -z "${PACING_NOTE:-}" ]] && PACING_NOTE="$RATE"
+    fi
+  fi
+
   printf '%8s  %10s  %10s  %7s%%  %9s  %8s  %8s  %s\n' \
          "$RATE" "$SENT" "$GOT" "$YIELD" "$DELTA" "$JIT_SD" "$JIT_MAX" "$VERDICT"
 done
 
 echo
 if [[ "$BEST" -gt 0 ]]; then
-  echo "Highest rate holding >=${PASS}% hardware TX timestamps: ${BEST} fps"
-  echo "  -> set STREAM_RATE=${BEST} in scripts/config.conf"
   MIN_US=$(awk -v r="$BEST" 'BEGIN{printf "%.0f", 1e6/r}')
-  echo "  -> that is one frame every ${MIN_US} us"
+  echo "TIMESTAMPING ceiling: ${BEST} fps still holds >=${PASS}% hardware TX"
+  echo "timestamps (one frame every ${MIN_US} us)."
+  echo
+  echo "This is a CEILING, not a recommended STREAM_RATE. It says the NIC can"
+  echo "hand back a timestamp for every frame at that rate; it says nothing"
+  echo "about whether the frames left on schedule. Read the GAP columns before"
+  echo "choosing a rate."
+  if [[ -n "${PACING_NOTE:-}" ]]; then
+    echo
+    echo "PACING WARNING: from ${PACING_NOTE} fps upward the worst-case on-wire"
+    echo "gap is two or more nominal periods (see the 'gap xN' verdicts). The"
+    echo "stream is bursty, not isochronous: clock_nanosleep cannot hold the"
+    echo "schedule when the period approaches the scheduler's own wakeup jitter."
+    echo "Every frame is still timestamped correctly, so latency per frame is"
+    echo "valid -- but the OFFERED LOAD PATTERN is not a clean CBR stream, and"
+    echo "queueing delay depends on the arrival pattern. Say so in any writeup."
+    echo "The fix is hardware pacing: SO_TXTIME + etf (REPORT.md open item #10)."
+  fi
 else
   echo "No rate reached ${PASS}% yield. Check 'ethtool -T ${IF}' for"
   echo "hardware-transmit support, and that this is really an igc interface."
