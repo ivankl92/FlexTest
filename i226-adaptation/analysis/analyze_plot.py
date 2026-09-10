@@ -164,6 +164,12 @@ def load_case(case_dir: Path) -> dict | None:
         # that predate that field.
         "tx_n": len(tx),
         "sent_n": int(meta.get("frames_sent") or 0) or len(tx),
+        # With sampled timestamping only every ts_every-th frame carries a
+        # timestamp. Latency per frame is unaffected, but IPDV is defined
+        # between CONSECUTIVE timestamped frames, so its spacing scales with
+        # this and the metric means something different. Carry it so the
+        # summary can say so instead of quietly changing definition.
+        "ts_every": int(meta.get("ts_every") or 1),
         "rx_n": len(rx),
         "matched": len(df),
         "latency_us": df["latency_ns"].to_numpy() / 1000.0,
@@ -216,6 +222,10 @@ def summarise(case: dict) -> dict:
         "lat_max_us": round(float(np.max(lat)), 3),
         "lat_std_us": round(float(np.std(lat)), 3),
         "ipdv_p99_abs_us": round(float(np.percentile(np.abs(ipdv), 99)), 3),
+        # IPDV is a delta between consecutive *timestamped* frames. State the
+        # spacing so a sampled run's IPDV is never silently compared with an
+        # unsampled one's.
+        "ipdv_frame_spacing": case["ts_every"],
         "software_timestamps": case["software_timestamps"],
     }
 
@@ -442,6 +452,13 @@ def main() -> int:
                   file=sys.stderr)
             print("     Its latency statistics are NOT comparable with the other points.",
                   file=sys.stderr)
+
+    sampled = sorted({c["ts_every"] for c in cases if c["ts_every"] > 1})
+    if sampled:
+        print(f"  ! sampled timestamping in use (every {', '.join(map(str, sampled))}"
+              "th frame). Per-frame latency is unaffected, but IPDV is measured "
+              "between frames that far apart -- do not compare it with an "
+              "unsampled run.", file=sys.stderr)
 
     modes = {c["qos"] for c in cases}
     if len(modes) < 2:

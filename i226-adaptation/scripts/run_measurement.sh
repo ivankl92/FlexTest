@@ -281,6 +281,7 @@ for QOS in $QOS_MODES; do
   "stream_rate_pps": ${STREAM_RATE},
   "stream_frame_bytes": ${STREAM_SIZE},
   "stream_duration_s": ${STREAM_DURATION},
+  "ts_every": ${STREAM_TS_EVERY:-1},
   "frames_sent": ${SENT},
   "tx_timestamps": ${TXN},
   "rx_timestamps": ${RXN},
