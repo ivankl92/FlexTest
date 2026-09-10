@@ -588,15 +588,43 @@ anything to show.
    correlated with latency outliers.
 8. **Switch-side telemetry.** Read KSwitch queue depths, drops and per-priority
    counters around each run, so switch behaviour is observed rather than inferred.
-9. **Sampled timestamping, for rates above the register limit.** *Lower priority
-   than originally assessed: the hardware sustains 20 kfps at full yield, so this
-   is only needed above that.* Send the full
-   stream on one socket and timestamp only every Nth frame on a second socket
-   with `SO_TIMESTAMPING` enabled. Keeps the intended stimulus rate while
-   sampling latency at a rate the TX registers can sustain — the workaround when
-   `tx_rate_selftest.sh` shows the target rate is out of reach. Related:
-   detecting saturation during preflight and reducing `STREAM_RATE`
-   automatically.
+9. ~~**Sampled timestamping, for rates above the register limit.**~~
+   **IMPLEMENTED as `tsn_tx -N` / `STREAM_TS_EVERY`, and it turned out to be
+   necessary for a reason nobody anticipated.** The original framing was wrong
+   twice over. It assumed the constraint was *our own* yield, and it assumed
+   100 % yield meant the rate was safe. Neither holds.
+
+   What actually happens at 10 000 fps on `igc`: `tsn_tx` requests a TX
+   timestamp on every frame and occupies the NIC's small set of TX-timestamp
+   registers continuously. **ptp4l, on the same interface, needs one for every
+   Pdelay_Req/Resp.** When it loses the race it logs
+
+   ```
+   timed out while polling for tx timestamp
+   increasing tx_timestamp_timeout may correct this issue, but it is
+   likely caused by a driver bug
+   port 1 (enp1s0): send peer delay request failed
+   port 1 (enp1s0): LISTENING to FAULTY on FAULT_DETECTED
+   ```
+
+   and the port cycles FAULTY → LISTENING → FAULTY indefinitely. The campaign
+   then skips every remaining point, because without gPTP there is no common
+   time base. Measured on the reference testbed:
+   `tx_hwtstamp_skipped = 78719` against 78 713 frames missing a timestamp in
+   the affected point — the driver's skip counter accounts for the shortfall
+   almost exactly.
+
+   The victim is ptp4l, not the measurement tool, which is why the yield column
+   showed nothing wrong until the damage was already done — `tx_rate_selftest.sh`
+   now polls `portState` per rate for exactly this reason.
+
+   `-N EVERY` requests a timestamp on every EVERY-th frame using a per-packet
+   `SO_TIMESTAMPING` control message on `sendmsg()` (the kernel masks it with
+   `SOF_TIMESTAMPING_TX_RECORD_MASK`, so only the TX record bits are overridden;
+   the socket keeps the generation bits). **The stream on the wire is
+   unchanged** — same rate, same offered load — only the sampling of it is
+   thinned. This is strictly better than lowering `STREAM_RATE`, which would
+   change the experiment's stimulus.
 
 10. **Hardware pacing via `SO_TXTIME` + `etf`.** *Now the binding constraint —
    and it is measured, not predicted.* `tx_rate_selftest.sh` on both PCs

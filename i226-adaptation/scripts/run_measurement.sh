@@ -237,7 +237,7 @@ for QOS in $QOS_MODES; do
     # 3. measured stream
     "$INSTALL_DIR/tsn_tx" -i "$PC1_STREAM_IF" -d "$PC2_MAC" \
         -n $(( STREAM_RATE * STREAM_DURATION )) -r "$STREAM_RATE" -s "$STREAM_SIZE" \
-        -p "$PCP" -v "$STREAM_VID" -q "$STREAM_SOCKPRIO" \
+        -p "$PCP" -v "$STREAM_VID" -q "$STREAM_SOCKPRIO" -N "${STREAM_TS_EVERY:-1}" \
         -o "${CASE_DIR}/tx.csv" >"${CASE_DIR}/tx.log" 2>&1 || warn "  tsn_tx returned non-zero"
 
     [[ -n "$IPERFPID" ]] && { wait "$IPERFPID" 2>/dev/null || true; }
@@ -261,6 +261,11 @@ for QOS in $QOS_MODES; do
     RXN=$(( $(wc -l < "${CASE_DIR}/rx.csv" 2>/dev/null || echo 1) - 1 ))
     SENT=$(grep -o 'sent=[0-9]*' "${CASE_DIR}/tx.log" 2>/dev/null | head -1 | cut -d= -f2)
     SENT=${SENT:-0}
+    # With sampled timestamping (STREAM_TS_EVERY > 1) far fewer timestamps are
+    # requested than frames sent, by design. Yield must be measured against the
+    # requests or a healthy sampled run looks like a total failure.
+    TSREQ=$(grep -o 'ts_requested=[0-9]*' "${CASE_DIR}/tx.log" 2>/dev/null | head -1 | cut -d= -f2)
+    TSREQ=${TSREQ:-$SENT}
 
     cat > "${CASE_DIR}/meta.json" <<EOF
 {
@@ -288,9 +293,9 @@ EOF
     # tx_ts" is not a paradox: some frames went out and arrived while their TX
     # timestamp was never retrieved.
     if (( SENT > 0 )); then
-      YIELD=$(LC_ALL=C awk -v a="$TXN" -v b="$SENT" 'BEGIN{printf "%.2f", 100*a/b}')
+      YIELD=$(LC_ALL=C awk -v a="$TXN" -v b="$TSREQ" 'BEGIN{printf "%.2f", (b>0)?100*a/b:0}')
       LOSS=$(LC_ALL=C awk -v a="$RXN" -v b="$SENT" 'BEGIN{printf "%.3f", 100*(1-a/b)}')
-      log "  sent=${SENT} tx_ts=${TXN} (${YIELD}% yield) rx=${RXN} (${LOSS}% loss)"
+      log "  sent=${SENT} ts_req=${TSREQ} tx_ts=${TXN} (${YIELD}% yield) rx=${RXN} (${LOSS}% loss)"
     else
       log "  tx_ts=${TXN} rx=${RXN}"
     fi
@@ -300,7 +305,7 @@ EOF
     # dropped by the offline join, so the point is built from an unrepresentative
     # subset. Mark it in the run directory rather than letting it look normal.
     if (( SENT > 0 )); then
-      if [[ $(LC_ALL=C awk -v a="$TXN" -v b="$SENT" 'BEGIN{print (100*a/b < 90) ? 1 : 0}') == 1 ]]; then
+      if [[ $(LC_ALL=C awk -v a="$TXN" -v b="$TSREQ" 'BEGIN{print (b>0 && 100*a/b < 90) ? 1 : 0}') == 1 ]]; then
         warn "  TX-timestamp yield ${YIELD}% (<90%) - this point is NOT trustworthy"
         warn "  the offline join keeps only timestamped frames, so it samples a biased subset"
         echo "TX timestamp yield ${YIELD}% (${TXN}/${SENT}); below the 90% threshold." \

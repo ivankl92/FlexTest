@@ -49,6 +49,13 @@ echo
 skipped() { ethtool -S "$IF" 2>/dev/null | awk '/tx_hwtstamp_skipped/{print $2; found=1}
                                                 END{if(!found) print "-"}'; }
 
+# portState of the local ptp4l, or "-" when ptp4l is not running here.
+ptp_state() {
+  [[ -r /etc/linuxptp/gPTP.cfg ]] || { echo "-"; return; }
+  pmc -u -b 0 -f /etc/linuxptp/gPTP.cfg 'GET PORT_DATA_SET' 2>/dev/null |
+    awk '/portState/{print $2; found=1} END{if(!found) print "-"}' | head -1
+}
+
 printf '%8s  %10s  %10s  %8s  %9s  %8s  %8s  %s\n' \
        RATE SENT TIMESTAMPS YIELD SKIPPED "GAP SD" "GAP MAX" VERDICT
 printf '%8s  %10s  %10s  %8s  %9s  %8s  %8s  %s\n' \
@@ -81,6 +88,16 @@ for RATE in $RATES; do
   if [[ "$OK" == "1" ]]; then VERDICT="ok"; BEST=$RATE
   else VERDICT="DEGRADED"; fi
   PERIOD_US=$(awk -v r="$RATE" 'BEGIN{printf "%.3f", 1e6/r}')
+
+  # 100 % yield for THIS tool does not mean the rate is safe. The NIC has a
+  # small number of TX-timestamp registers, and ptp4l on the same interface
+  # needs one for every Pdelay message. If we take them all, ptp4l logs
+  # "timed out while polling for tx timestamp" and the port goes FAULTY --
+  # which the yield column cannot see. Check the victim directly.
+  if [[ "$(ptp_state)" == "FAULTY" ]]; then
+    VERDICT="$VERDICT / ptp4l FAULTY"
+    PTP_VICTIM=${PTP_VICTIM:-$RATE}
+  fi
 
   # A software-timestamp fallback would invalidate the whole measurement.
   if grep -q ',sw$' "$TMP/tx_${RATE}.csv" 2>/dev/null; then
@@ -127,6 +144,17 @@ if [[ "$BEST" -gt 0 ]]; then
   echo "hand back a timestamp for every frame at that rate; it says nothing"
   echo "about whether the frames left on schedule. Read the GAP columns before"
   echo "choosing a rate."
+  if [[ -n "${PTP_VICTIM:-}" ]]; then
+    echo
+    echo "PTP WARNING: ptp4l on ${IF} went FAULTY at ${PTP_VICTIM} fps and above."
+    echo "This tool took the NIC's TX-timestamp registers and starved it. Yield"
+    echo "stayed high because the victim is ptp4l, not us -- and without gPTP"
+    echo "there is no common time base, so no latency can be measured at all."
+    echo "Do NOT use a rate at or above ${PTP_VICTIM} fps with timestamping on"
+    echo "every frame. Either lower the rate, or keep the rate and thin the"
+    echo "timestamp requests with tsn_tx -N / STREAM_TS_EVERY in config.conf."
+    echo "Recover with: systemctl reset-failed ptp4l@${IF}; systemctl restart ptp4l@${IF}"
+  fi
   if [[ -n "${PACING_NOTE:-}" ]]; then
     echo
     echo "PACING WARNING: from ${PACING_NOTE} fps upward the worst-case on-wire"

@@ -26,6 +26,7 @@ static struct tx_record *records;
 static uint32_t records_len;
 static uint64_t hw_ts_seen;
 static int allow_sw = 0;   /* -S: accept software timestamps when hardware is absent */
+static uint32_t ts_every = 1;  /* -N: request a TX timestamp on every Nth frame */
 
 static void usage(const char *p)
 {
@@ -42,7 +43,14 @@ static void usage(const char *p)
         "  -o FILE      output CSV                       (default tx.csv)\n"
         "  -w SECONDS   extra time to wait for trailing TX timestamps (default 2)\n"
         "  -S           accept software TX timestamps when hardware ones are absent\n"
-        "               (diagnostic / veth testing only - degrades accuracy)\n",
+        "               (diagnostic / veth testing only - degrades accuracy)\n"
+        "  -N EVERY     request a TX timestamp on every EVERY-th frame only\n"
+        "               (default 1 = every frame). The full stream still goes on\n"
+        "               the wire; only the timestamp requests are thinned. Use this\n"
+        "               when ptp4l on the same interface reports 'timed out while\n"
+        "               polling for tx timestamp': the NIC has a small number of TX\n"
+        "               timestamp registers and this tool competes with ptp4l for\n"
+        "               them. Check `ethtool -S <if> | grep tx_hwtstamp_skipped`.\n",
         p);
 }
 
@@ -123,7 +131,7 @@ int main(int argc, char **argv)
     int wait_s = 2;
     int opt;
 
-    while ((opt = getopt(argc, argv, "i:d:n:r:s:p:v:q:o:w:Sh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:d:n:r:s:p:v:q:o:w:N:Sh")) != -1) {
         switch (opt) {
         case 'i': ifname = optarg; break;
         case 'd': if (parse_mac(optarg, dst) < 0) { fprintf(stderr, "bad MAC\n"); return 2; }
@@ -137,6 +145,9 @@ int main(int argc, char **argv)
         case 'o': out = optarg; break;
         case 'w': wait_s = atoi(optarg); break;
         case 'S': allow_sw = 1; break;
+        case 'N': ts_every = (uint32_t)strtoul(optarg, NULL, 10);
+                  if (ts_every == 0) ts_every = 1;
+                  break;
         default: usage(argv[0]); return 2;
         }
     }
@@ -179,14 +190,33 @@ int main(int argc, char **argv)
     else
         fprintf(stderr, "[%s] SO_PRIORITY=%d\n", ifname, sockprio);
 
-    int tsflags = SOF_TIMESTAMPING_TX_HARDWARE |
-                  SOF_TIMESTAMPING_RAW_HARDWARE |
-                  SOF_TIMESTAMPING_SOFTWARE |
-                  SOF_TIMESTAMPING_TX_SOFTWARE;
+    /*
+     * The TX *record* bits (TX_HARDWARE / TX_SOFTWARE) say "timestamp this
+     * frame"; the generation bits (RAW_HARDWARE / SOFTWARE) say how to report
+     * it. Only the record bits can be overridden per packet, via a
+     * SO_TIMESTAMPING control message on sendmsg() -- the kernel masks a
+     * per-packet cmsg with SOF_TIMESTAMPING_TX_RECORD_MASK.
+     *
+     * So for sampled timestamping (-N > 1) we leave the record bits OFF on the
+     * socket and switch them on per frame for the sampled ones. Frames without
+     * the cmsg then never occupy a TX timestamp register, which is the whole
+     * point: the I226 has only a handful, and ptp4l on the same interface needs
+     * one for every Pdelay_Req/Resp. Losing that race is what puts ptp4l into
+     * portState FAULTY.
+     *
+     * With -N 1 (the default) nothing changes: the record bits stay on the
+     * socket and the send path is exactly as before.
+     */
+    int tsflags = SOF_TIMESTAMPING_RAW_HARDWARE |
+                  SOF_TIMESTAMPING_SOFTWARE;
+    if (ts_every == 1)
+        tsflags |= SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_TX_SOFTWARE;
     if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING, &tsflags, sizeof(tsflags)) < 0) {
         perror("setsockopt(SO_TIMESTAMPING)");
         return 1;
     }
+    if (ts_every > 1)
+        fprintf(stderr, "[%s] sampled timestamping: 1 frame in %u\n", ifname, ts_every);
 
     /* Build the frame template. */
     uint8_t frame[TSN_MAX_FRAME];
@@ -227,7 +257,7 @@ int main(int argc, char **argv)
     next.tv_nsec = 0;
     next.tv_sec += 1;
 
-    uint64_t sent = 0, send_err = 0;
+    uint64_t sent = 0, send_err = 0, ts_requested = 0;
     for (uint32_t seq = 0; seq < count && !stop_flag; seq++) {
         clock_nanosleep(CLOCK_TAI, TIMER_ABSTIME, &next, NULL);
 
@@ -238,7 +268,31 @@ int main(int argc, char **argv)
         memcpy(frame + payload_off, &pl, sizeof(pl));
         records[seq].sw_tx_ns = ntoh64(pl.sw_tx_ns);
 
-        ssize_t n = send(fd, frame, (size_t)size, 0);
+        ssize_t n;
+        if (ts_every == 1) {
+            n = send(fd, frame, (size_t)size, 0);
+        } else {
+            struct iovec iov = { .iov_base = frame, .iov_len = (size_t)size };
+            struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+            union {
+                char buf[CMSG_SPACE(sizeof(uint32_t))];
+                struct cmsghdr align;
+            } cbuf;
+            if (seq % ts_every == 0) {
+                uint32_t req = SOF_TIMESTAMPING_TX_HARDWARE;
+                if (allow_sw) req |= SOF_TIMESTAMPING_TX_SOFTWARE;
+                memset(&cbuf, 0, sizeof(cbuf));
+                msg.msg_control = cbuf.buf;
+                msg.msg_controllen = sizeof(cbuf.buf);
+                struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+                cm->cmsg_level = SOL_SOCKET;
+                cm->cmsg_type  = SO_TIMESTAMPING;
+                cm->cmsg_len   = CMSG_LEN(sizeof(uint32_t));
+                memcpy(CMSG_DATA(cm), &req, sizeof(req));
+                ts_requested++;
+            }
+            n = sendmsg(fd, &msg, 0);
+        }
         if (n < 0) {
             send_err++;
             if (send_err < 10)
@@ -257,7 +311,8 @@ int main(int argc, char **argv)
     /* Collect trailing timestamps. */
     struct pollfd pfd = { .fd = fd, .events = POLLERR, .revents = 0 };
     uint64_t deadline = now_ns(CLOCK_MONOTONIC) + (uint64_t)wait_s * 1000000000ULL;
-    while (now_ns(CLOCK_MONOTONIC) < deadline && hw_ts_seen < sent) {
+    uint64_t expect_ts = (ts_every == 1) ? sent : ts_requested;
+    while (now_ns(CLOCK_MONOTONIC) < deadline && hw_ts_seen < expect_ts) {
         poll(&pfd, 1, 100);
         drain_errqueue(fd);
     }
@@ -278,13 +333,29 @@ int main(int argc, char **argv)
     }
     fclose(f);
 
-    fprintf(stderr, "[%s] sent=%llu send_errors=%llu hw_tx_timestamps=%llu (%.2f%%) -> %s\n",
+    /* Yield is timestamps recovered over timestamps REQUESTED. With -N > 1 the
+     * two differ by construction, and dividing by `sent` would report a
+     * healthy sampled run as a catastrophic failure. */
+    fprintf(stderr, "[%s] sent=%llu send_errors=%llu ts_requested=%llu "
+            "hw_tx_timestamps=%llu (%.2f%%) -> %s\n",
             ifname, (unsigned long long)sent, (unsigned long long)send_err,
-            (unsigned long long)written,
-            sent ? 100.0 * (double)written / (double)sent : 0.0, out);
-    if (sent && (double)written / (double)sent < 0.9)
-        fprintf(stderr, "[%s] WARNING: many TX timestamps missing - lower the rate (-r) "
-                        "or the I226 TX timestamp registers are saturating\n", ifname);
+            (unsigned long long)expect_ts, (unsigned long long)written,
+            expect_ts ? 100.0 * (double)written / (double)expect_ts : 0.0, out);
+
+    /* If the kernel ignored the per-packet cmsg it would have timestamped every
+     * frame, so we would see far more timestamps than we asked for. Say so
+     * rather than silently reporting a sampled run that never sampled. */
+    if (ts_every > 1 && written > expect_ts + expect_ts / 10)
+        fprintf(stderr, "[%s] WARNING: %llu timestamps for %llu requests - the kernel "
+                        "appears to ignore per-packet SO_TIMESTAMPING on this socket, "
+                        "so -N did not reduce TX-timestamp pressure\n",
+                ifname, (unsigned long long)written, (unsigned long long)expect_ts);
+
+    if (expect_ts && (double)written / (double)expect_ts < 0.9)
+        fprintf(stderr, "[%s] WARNING: many TX timestamps missing - lower the rate (-r), "
+                        "raise -N, or the I226 TX timestamp registers are saturating "
+                        "(check: ethtool -S %s | grep tx_hwtstamp_skipped)\n",
+                ifname, ifname);
 
     free(records);
     close(fd);
