@@ -172,6 +172,27 @@ def load_case(case_dir: Path) -> dict | None:
     }
 
 
+def to_markdown_table(df) -> str:
+    """Render a DataFrame as a GitHub markdown table.
+
+    Deliberately hand-rolled rather than DataFrame.to_markdown(), which needs
+    the optional 'tabulate' package. That dependency is not in setup_node.sh's
+    apt list, so on a fresh node the analysis ran the whole campaign, wrote
+    summary.csv and every figure, and then died on the last line with
+    ModuleNotFoundError. A summary table is not worth a dependency that can
+    fail that late.
+    """
+    head = [str(c) for c in df.columns]
+    rows = [[("" if v is None else str(v)) for v in rec] for rec in df.to_numpy()]
+    width = [max(len(head[i]), *(len(r[i]) for r in rows)) if rows else len(head[i])
+             for i in range(len(head))]
+    line = lambda cells: "| " + " | ".join(
+        c.ljust(width[i]) for i, c in enumerate(cells)) + " |"
+    return "\n".join([line(head),
+                      "|" + "|".join("-" * (w + 2) for w in width) + "|",
+                      *(line(r) for r in rows)])
+
+
 def summarise(case: dict) -> dict:
     lat = case["latency_us"]
     ipdv = np.diff(lat) if len(lat) > 1 else np.array([0.0])
@@ -464,7 +485,7 @@ def main() -> int:
         if SYNTHETIC_NOTE:
             md += ["```", SYNTHETIC_NOTE, "```", ""]
     md += [f"Run: `{root.name}`", ""]
-    md.append(summary[cols].to_markdown(index=False))
+    md.append(to_markdown_table(summary[cols]))
     if summary["software_timestamps"].any():
         md += ["", "> **Warning:** at least one measurement point fell back to software "
                    "timestamps. Those numbers include host-stack jitter and are not "
