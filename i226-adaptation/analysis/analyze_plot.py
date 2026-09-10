@@ -623,9 +623,13 @@ def main() -> int:
         fig_timeseries(cases, figures)
 
     # markdown summary, easy to paste into a report
-    cols = ["series", "background_load_pct", "frames_sent", "frames_received", "loss_pct",
-            "tx_ts_yield_pct",
-            "lat_median_us", "lat_p99_us", "lat_max_us", "lat_std_us"]
+    # The across-repetition interval belongs in the headline table. Printing
+    # pooled medians without it invites exactly the reading we are trying to
+    # avoid -- "13.160 vs 13.160, and 20.5 vs 23.0, so the second one differs".
+    cols = ["series", "background_load_pct", "repetitions",
+            "median_across_reps_us", "median_ci95_us",
+            "p99_across_reps_us", "p99_ci95_us",
+            "lat_median_us", "lat_p99_us", "lat_max_us", "loss_pct"]
     title = ("# TSN-FlexTest (I226 adaptation) - SYNTHETIC FIXTURE, NOT MEASURED DATA"
              if SYNTHETIC else
              "# TSN-FlexTest (I226 adaptation) - measurement summary")
