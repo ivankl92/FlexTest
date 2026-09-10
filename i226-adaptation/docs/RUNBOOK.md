@@ -365,7 +365,9 @@ kernel or NIC change — see `REPORT.md` §8.
 | `BG_LOADS` | `0 50 80 95 105` | background load points, % of detected link rate. `105` deliberately oversubscribes |
 | `BG_STREAMS` | `4` | parallel iperf3 UDP streams (one stream is often CPU-bound below line rate) |
 | `BG_DGRAM` | `1400` | UDP payload bytes for background traffic |
-| `QOS_MODES` | `none dot1p` | configurations compared. `none` → `STREAM_PCP_LOW`, `dot1p` → `STREAM_PCP_HIGH` |
+| `QOS_MODES` | `none dot1p` | configurations compared. `none` → `STREAM_PCP_LOW`, `dot1p` → `STREAM_PCP_HIGH`. Reverse the order (`dot1p none`) as a control: if a difference follows the *position* rather than the mode, it is drift, not QoS |
+| `REPETITIONS` | `3` | measurements per point, interleaved round by round. **1 is not enough** — run-to-run drift on this testbed reached 11 µs at the median, which is larger than any QoS effect seen so far. Runtime scales linearly |
+| `STREAM_TS_EVERY` | `1` | request a hardware TX timestamp on every Nth frame. Raise to 4–10 if ptp4l goes FAULTY (§12); the stream on the wire is unchanged |
 | `RESULT_ROOT` | `.../results` | where run directories are created |
 
 **Runtime estimate:** `|QOS_MODES| × |BG_LOADS| × (STREAM_DURATION + ~20 s)`.
@@ -454,9 +456,19 @@ Produces `summary.csv`, `summary.md`, and in `figures/` (PNG + PDF):
 | `05_latency_timeseries` | per-frame latency at the heaviest load (diagnostic) |
 
 Columns in `summary.csv`: `data_source`, `qos_mode`, `series`,
-`background_load_pct`, `frames_{sent,received,matched}`, `loss_pct`,
-`lat_{min,mean,median,p99,p999,max,std}_us`, `ipdv_p99_abs_us`,
-`software_timestamps`.
+`background_load_pct`, `repetitions`, `median_across_reps_us`,
+`median_ci95_us`, `p99_across_reps_us`, `p99_ci95_us`, `mean_ci99_us_upstream`,
+`frames_{sent,received,matched}`, `tx_timestamps`, `tx_ts_yield_pct`,
+`loss_pct`, `lat_{min,mean,median,p99,p999,max,std}_us`, `ipdv_p99_abs_us`,
+`ipdv_frame_spacing`, `software_timestamps`.
+
+**Which interval to quote.** `median_ci95_us` / `p99_ci95_us` are computed
+**across repetitions** and are the ones that say whether a difference between
+two configurations is real. `mean_ci99_us_upstream` reproduces upstream's
+`confidence-interval.ipynb` formula (per-frame, within a single run, 99 %) so
+results stay comparable with the published work — but it is typically ~100×
+narrower and is blind to run-to-run drift. Do not use it to argue that two
+configurations differ.
 
 **Sanity checks on the numbers**
 

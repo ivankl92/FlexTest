@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -170,12 +171,104 @@ def load_case(case_dir: Path) -> dict | None:
         # this and the metric means something different. Carry it so the
         # summary can say so instead of quietly changing definition.
         "ts_every": int(meta.get("ts_every") or 1),
+        "rep": int(meta.get("repetition") or 1),
         "rx_n": len(rx),
         "matched": len(df),
         "latency_us": df["latency_ns"].to_numpy() / 1000.0,
         "seq": df["seq"].to_numpy(),
         "software_timestamps": sw_used,
     }
+
+
+# Student t, two-sided 95 %, by degrees of freedom (n-1). Repetition counts are
+# small, so the normal quantile would understate the interval badly at n=3.
+_T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+        8: 2.306, 9: 2.262, 10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086, 30: 2.042}
+_Z99 = 2.5758293035489004   # NormalDist().inv_cdf((1+0.99)/2), as upstream uses
+
+
+def t95(df_: int) -> float:
+    if df_ <= 0:
+        return float("nan")
+    for k in sorted(_T95):
+        if df_ <= k:
+            return _T95[k]
+    return 1.960
+
+
+def upstream_ci99(samples) -> float:
+    """Confidence interval exactly as upstream's confidence-interval.ipynb.
+
+        dist = NormalDist.from_samples(data)
+        e = dist.stdev * z / ((len(data) - 1) ** .5)     # z for 99 %
+
+    This is the precision of the MEAN within one run, over individual frames.
+    Two caveats worth stating whenever it is quoted:
+      * it says nothing about run-to-run variability -- on this testbed the
+        median moved by ~11 us between two campaigns with identical settings,
+        which a within-run interval cannot see;
+      * consecutive frames are strongly autocorrelated (queueing arrives in
+        bursts), so treating them as independent makes the interval optimistic.
+    Reported because the published method uses it and results should be
+    comparable, not because it is the right interval for our question.
+    """
+    n = len(samples)
+    if n < 2:
+        return float("nan")
+    return float(np.std(samples, ddof=1) * _Z99 / math.sqrt(n - 1))
+
+
+def merge_reps(cases: list) -> list:
+    """Group repetitions of the same (qos, load) point into one merged case.
+
+    Frame-level statistics are computed on the POOLED samples, which matches
+    the published method (aggregate packet-level data rather than averaging
+    per-run summaries). Per-repetition summaries are kept alongside so the
+    across-run interval can be computed too -- that is the one that answers
+    "is this difference real or is it drift between runs".
+    """
+    groups: dict[tuple, list] = {}
+    for c in cases:
+        groups.setdefault((c["qos"], c["load"]), []).append(c)
+
+    merged = []
+    for (qos, load), reps in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        reps.sort(key=lambda c: c.get("rep", 1))
+        lat = np.concatenate([r["latency_us"] for r in reps])
+        merged.append({
+            "dir": reps[0]["dir"],
+            "meta": reps[0]["meta"],
+            "qos": qos,
+            "load": load,
+            "latency_us": lat,
+            # The time series plots one repetition, not the pooled samples:
+            # concatenating repetitions would draw a discontinuity at each
+            # boundary and the sequence numbers would restart. Keep the first
+            # repetition's seq and latency arrays paired and equal in length.
+            "seq": reps[0]["seq"],
+            "latency_first_us": reps[0]["latency_us"],
+            "ts_every": reps[0]["ts_every"],
+            "n_reps": len(reps),
+            "tx_n": sum(r["tx_n"] for r in reps),
+            "sent_n": sum(r["sent_n"] for r in reps),
+            "rx_n": sum(r["rx_n"] for r in reps),
+            "matched": sum(r["matched"] for r in reps),
+            "software_timestamps": any(r["software_timestamps"] for r in reps),
+            "rep_median": [float(np.median(r["latency_us"])) for r in reps],
+            "rep_p99": [float(np.percentile(r["latency_us"], 99)) for r in reps],
+            "degraded": [r["dir"].name for r in reps if (r["dir"] / "DEGRADED").exists()],
+        })
+    return merged
+
+
+def across_rep(values: list) -> tuple:
+    """mean and half-width of the 95 % t interval across repetitions."""
+    n = len(values)
+    if n < 2:
+        return (float(values[0]) if values else float("nan")), float("nan")
+    m = float(np.mean(values))
+    sd = float(np.std(values, ddof=1))
+    return m, t95(n - 1) * sd / math.sqrt(n)
 
 
 def to_markdown_table(df) -> str:
@@ -204,10 +297,22 @@ def summarise(case: dict) -> dict:
     ipdv = np.diff(lat) if len(lat) > 1 else np.array([0.0])
     sent = case["sent_n"]
     loss = 100.0 * (1.0 - case["rx_n"] / sent) if sent else float("nan")
+    med_m, med_ci = across_rep(case.get("rep_median", []))
+    p99_m, p99_ci = across_rep(case.get("rep_p99", []))
     return {
         "qos_mode": case["qos"],
         "series": SERIES.get(case["qos"], {}).get("label", case["qos"]),
         "background_load_pct": case["load"],
+        "repetitions": case.get("n_reps", 1),
+        # Across-repetition interval: the one that says whether a difference
+        # between two configurations survives run-to-run drift. NaN at n=1.
+        "median_across_reps_us": round(med_m, 3),
+        "median_ci95_us": round(med_ci, 3) if med_ci == med_ci else float("nan"),
+        "p99_across_reps_us": round(p99_m, 3),
+        "p99_ci95_us": round(p99_ci, 3) if p99_ci == p99_ci else float("nan"),
+        # Within-run interval on the mean, computed exactly as upstream's
+        # confidence-interval.ipynb, for comparability with the published work.
+        "mean_ci99_us_upstream": round(upstream_ci99(lat), 4),
         "frames_sent": sent,
         "tx_timestamps": case["tx_n"],
         "tx_ts_yield_pct": round(100.0 * case["tx_n"] / sent, 4) if sent else float("nan"),
@@ -243,6 +348,14 @@ def fig_latency_vs_load(cases, out: Path):
         p99 = [float(np.percentile(c["latency_us"], 99)) for c in sel]
         ax.fill_between(loads, med, p99, color=style["color"], alpha=0.14, linewidth=0)
         ax.plot(loads, p99, color=style["color"], linewidth=1.2, linestyle=(0, (4, 3)), alpha=0.9)
+        # Error bars are the 95 % t interval of the median ACROSS repetitions.
+        # Without them a 2 us gap between series looks decisive; with them it
+        # is often visibly inside the noise.
+        err = [across_rep(c.get("rep_median", []))[1] for c in sel]
+        if any(e == e for e in err):          # any non-NaN, i.e. n_reps > 1
+            ax.errorbar(loads, med, yerr=[0 if e != e else e for e in err],
+                        fmt="none", ecolor=style["color"], elinewidth=1.1,
+                        capsize=3, capthick=1.1, alpha=0.9)
         ax.plot(loads, med, color=style["color"], marker=style["marker"],
                 label=style["label"], markeredgecolor=SURFACE, markeredgewidth=1.5)
         # direct label at the right end, so identity is never colour-alone
@@ -254,7 +367,11 @@ def fig_latency_vs_load(cases, out: Path):
     ax.set_xlabel("Background load on second port pair (% of link rate)")
     ax.set_ylabel("One-way latency (µs)")
     ax.yaxis.set_major_formatter(FuncFormatter(us_fmt))
-    ax.text(0.0, 1.012, "solid = median · dashed = 99th percentile · band = median…p99",
+    nrep = max((c.get("n_reps", 1) for c in cases), default=1)
+    caption = "solid = median · dashed = 99th percentile · band = median…p99"
+    caption += (f" · bars = 95 % CI over {nrep} repetitions" if nrep > 1
+                else " · SINGLE RUN, no error bars — differences may be run-to-run drift")
+    ax.text(0.0, 1.012, caption,
             transform=ax.transAxes, fontsize=8.5, color=INK_MUTED, va="bottom")
     ax.legend(loc="upper left")
     despine(ax)
@@ -395,7 +512,8 @@ def fig_timeseries(cases, out: Path):
             ax.set_visible(False)
             continue
         c = sel[0]
-        ax.plot(c["seq"], c["latency_us"], color=style["color"], linewidth=0.7, alpha=0.85)
+        lat_one = c.get("latency_first_us", c["latency_us"])
+        ax.plot(c["seq"], lat_one, color=style["color"], linewidth=0.7, alpha=0.85)
         ax.set_title(style["label"], fontsize=10)
         ax.set_ylabel("Latency (µs)")
         despine(ax)
@@ -452,6 +570,23 @@ def main() -> int:
                   file=sys.stderr)
             print("     Its latency statistics are NOT comparable with the other points.",
                   file=sys.stderr)
+
+    # Collapse repetitions of the same (qos, load) before any statistics.
+    n_before = len(cases)
+    cases = merge_reps(cases)
+    reps = max(c["n_reps"] for c in cases)
+    if reps > 1:
+        print(f"  {n_before} runs -> {len(cases)} measurement points, "
+              f"up to {reps} repetitions each")
+    else:
+        print("  ! single run per point: summary.csv reports no across-run "
+              "confidence interval, and differences between configurations "
+              "cannot be separated from run-to-run drift. Set REPETITIONS in "
+              "config.conf.", file=sys.stderr)
+    for c in cases:
+        if c["degraded"]:
+            print(f"  !! {c['qos']} @ {c['load']}%: degraded repetition(s) pooled in: "
+                  f"{', '.join(c['degraded'])}", file=sys.stderr)
 
     sampled = sorted({c["ts_every"] for c in cases if c["ts_every"] > 1})
     if sampled:

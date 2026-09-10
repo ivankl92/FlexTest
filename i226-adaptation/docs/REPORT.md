@@ -560,10 +560,46 @@ anything to show.
    Would make upstream's statistics CSV, its plotting code and the `paper_*.ipynb`
    notebooks work on this data, and make results comparable with the paper and
    the ieee-dataport datasets.
-2. **Repetitions and confidence intervals.** Currently one run per point.
-   Upstream ships `confidence-interval.ipynb`; the campaign should repeat each
-   point N times and report intervals. Without this, differences between
-   configurations have no error bars.
+2. ~~**Repetitions and confidence intervals.**~~ **IMPLEMENTED**, and the
+   implementation deliberately differs from upstream's, because upstream's
+   method would not have caught the problem that forced this.
+
+   Upstream's `confidence-interval.ipynb` computes
+
+   ```python
+   dist = NormalDist.from_samples(data)          # data = per-frame latencies
+   e = dist.stdev * z / ((len(data) - 1) ** .5)  # z for 99 %
+   ```
+
+   — the precision of the mean *within one run*, over individual frames. The
+   paper follows the same philosophy: long single runs (30 min for the generic
+   stream) with CCDFs over pooled packets, rather than repeated independent
+   runs. Its "at most ten times" is a retry-on-error mechanism, not a
+   statistical repetition.
+
+   That interval is ~0.02 µs on our data. It is also **blind to the dominant
+   source of variation here**: two campaigns with identical settings produced
+   medians 11 µs apart, and at 50 % load a spurious 10 µs "802.1p effect"
+   appeared in a run where 802.1Q was *disabled on the switch* — where the
+   mechanism could not act. Within-run intervals cannot see run-to-run drift,
+   and per-frame samples are strongly autocorrelated anyway (queueing arrives
+   in bursts), which makes the interval optimistic even on its own terms.
+
+   So `summary.csv` now reports **both**:
+
+   | Column | Meaning |
+   |---|---|
+   | `mean_ci99_us_upstream` | upstream's formula, exactly, for comparability with the published work |
+   | `median_ci95_us`, `p99_ci95_us` | 95 % Student-t interval **across repetitions** — the one that answers "is this difference real" |
+
+   `REPETITIONS` in `config.conf` (default 3) drives it. Rounds are
+   **interleaved** — a full sweep of every point, then the next sweep — so slow
+   drift in the background load cannot masquerade as a difference between
+   configurations. Frame-level statistics are computed on the pooled samples,
+   matching the published method; only the interval differs. Figure 01 draws
+   the across-repetition interval as error bars, and says so in its caption;
+   with `REPETITIONS=1` it says instead that the run is single and differences
+   may be drift.
 3. **Frame-size sweep.** Upstream sweeps 64 B and 1518 B background frames; we
    fix `BG_DGRAM=1400`. Background frame size strongly affects switch queueing
    and is arguably the most interesting missing axis.

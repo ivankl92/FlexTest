@@ -189,9 +189,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
+REPS=${REPETITIONS:-1}
+[[ "$REPS" =~ ^[0-9]+$ ]] && (( REPS >= 1 )) || REPS=1
+
+# Repetitions are interleaved, not blocked: the outer loop is the repetition,
+# so a full sweep of every (QoS, load) point completes before the next round
+# starts. Blocking them (three runs of the same point back to back) would let
+# any slow drift in the background load masquerade as a difference between
+# configurations - which is exactly the artefact that made a 10 us "802.1p
+# effect" appear at 50 % load with 802.1Q disabled on the switch.
 TOTAL=0
 for _q in $QOS_MODES; do for _l in $BG_LOADS; do TOTAL=$((TOTAL+1)); done; done
+TOTAL=$(( TOTAL * REPS ))
 N=0
+(( REPS > 1 )) && log "repetitions: $REPS per point, interleaved (round 1 of all points, then round 2, ...)"
+
+for REP in $(seq 1 "$REPS"); do
+(( REPS > 1 )) && log "===== repetition round $REP of $REPS ====="
 
 for QOS in $QOS_MODES; do
   if [[ "$QOS" == "dot1p" ]]; then PCP="$STREAM_PCP_HIGH"; else PCP="$STREAM_PCP_LOW"; fi
@@ -203,6 +217,7 @@ for QOS in $QOS_MODES; do
   for LOAD in $BG_LOADS; do
     N=$((N+1))
     LABEL="${QOS}_load${LOAD}"
+    (( REPS > 1 )) && LABEL="${LABEL}_r${REP}"
     CASE_DIR="${OUTDIR}/${LABEL}"
     mkdir -p "$CASE_DIR"
     MBPS=$(( BG_SPEED * LOAD / 100 ))
@@ -281,6 +296,8 @@ for QOS in $QOS_MODES; do
   "stream_rate_pps": ${STREAM_RATE},
   "stream_frame_bytes": ${STREAM_SIZE},
   "stream_duration_s": ${STREAM_DURATION},
+  "repetition": ${REP},
+  "repetitions_total": ${REPS},
   "ts_every": ${STREAM_TS_EVERY:-1},
   "frames_sent": ${SENT},
   "tx_timestamps": ${TXN},
@@ -317,6 +334,7 @@ EOF
     sleep 5   # cool down, matches the original testbed's inter-run pause
   done
 done
+done   # repetition round
 
 # restore a clean state
 "$INSTALL_DIR/qos_config.sh" "$PC1_STREAM_IF" none || true
