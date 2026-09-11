@@ -315,6 +315,79 @@ JSON. 3.18 is the floor, 3.21 the recommendation.
 checks both nodes' versions *and* sends 2 seconds of real UDP down the
 background path before the campaign starts.
 
+### 5.6 All four addresses are in one subnet — and why that breaks UDP
+
+`192.168.1.61/71` (stream) and `192.168.1.62/72` (background) are one `/24`
+spread over two interfaces per node. That gives the kernel **two equal-cost
+routes for the same prefix**, and for anything it originates it picks by
+interface index — the *stream* port — regardless of which port you meant.
+
+The strict-ARP sysctls in §5.4 do **not** cover this. They decide who answers
+ARP; source-address selection for a locally-originated packet is a separate
+route lookup, and nothing in `arp_filter`/`arp_ignore`/`arp_announce` touches it.
+
+The symptom is iperf3's UDP handshake, and it is thoroughly misleading. The
+client sends `UDP_CONNECT_MSG` to `192.168.1.72:5201` on a socket **connected**
+to `.72`, and waits with a 30-second `SO_RCVTIMEO`. PC 2 replies — but from
+`.71`. The kernel drops a datagram from the wrong peer before iperf3 ever sees
+it, the timer expires, and you get:
+
+```
+iperf3: error - unable to read from stream socket: Resource temporarily unavailable
+```
+
+TCP is unaffected, because an accepted socket's addresses are fixed by the
+handshake. So the control connection succeeds, the server cheerfully logs
+`Server listening on 5201 (test #1)`, and only the data path fails — which is
+exactly what makes this look like an iperf3 bug instead of a routing one.
+
+Confirm it in one capture on the talker:
+
+```bash
+sudo timeout 40 tcpdump -nni any udp and port 5201 &
+iperf3 -c 192.168.1.72 -B 192.168.1.62 -u -b 10M -l 1400 -t 2
+```
+
+```
+enp2s0 Out IP 192.168.1.62.44668 > 192.168.1.72.5201: UDP, length 4
+enp2s0 In  IP 192.168.1.71.5201 > 192.168.1.62.44668: UDP, length 4
+               ^^^^^^^^^^^^ should be .72
+```
+
+and on the listener, the one line that explains it:
+
+```bash
+ip route get 192.168.1.62
+# 192.168.1.62 dev enp1s0 src 192.168.1.71     <- wrong interface, wrong source
+```
+
+**Fix — a /32 host route with an explicit source**, which beats the `/24` on
+longest-prefix match. `run_measurement.sh` now installs and verifies this on
+both nodes at the start of every campaign, so normally you do not have to. To
+do it by hand, or to make `setup_node.sh` do it, pass the peer's background
+address:
+
+```bash
+# PC 1                                        # PC 2
+sudo ip route replace 192.168.1.72/32 \       sudo ip route replace 192.168.1.62/32 \
+     dev enp2s0 src 192.168.1.62                   dev enp2s0 src 192.168.1.72
+
+sudo ./setup_node.sh … --bg-ip 192.168.1.62/24 --peer-bg-ip 192.168.1.72
+```
+
+> ⚠️ Like the sysctls in §5.4, these routes are **runtime-only and lost on
+> reboot**. That is why the campaign driver re-installs them rather than
+> trusting that setup ran at some point.
+
+**The better fix, if you are willing to re-address:** give the background pair
+its own subnet — `192.168.2.62/24` and `192.168.2.72/24`. The ambiguity then
+cannot arise, no host routes are needed, and the separation between the
+measured path and the load path becomes structural instead of a sysctl you
+must remember to re-apply. Nothing on the switches changes; they see one flat
+L2 either way. It is two edits: the `--bg-ip` arguments to `setup_node.sh` and
+`PC1_BG_IP`/`PC2_BG_IP` in `config.conf`. `setup_node.sh` warns whenever it
+finds the stream and background addresses sharing a prefix.
+
 ---
 
 ## 6. Verification gates
@@ -616,7 +689,8 @@ indexed by priority, and its value is the traffic class.
 | Latency plausible but identical in both QoS modes | Switch not applying strict priority on PCP | Check the KSwitch PCP→traffic-class mapping and scheduler. **Report this as a finding** |
 | **Latency is the same at every load, to the last 0.01 µs** (e.g. 13.14 µs at 0 %, 50 % and 105 %), and `iperf3.err` contains *unable to read from stream socket: Resource temporarily unavailable* | **The background load generator is dead and nothing else is.** The stream is still sent, timestamped and analysed, so the campaign produces a clean, plausible, entirely meaningless dataset. The usual cause on Ubuntu 24.04 is **iperf 3.16**: that release made iperf3 multi-threaded and shipped thread-lifetime bugs with it, and the *server* takes SIGSEGV as soon as a UDP test connects. Confirm on the listener: `journalctl -u iperf3-bg -n 30` shows `Main process exited, code=dumped, status=11/SEGV` and a climbing `restart counter` | `sudo scripts/fix_iperf3.sh` **on both nodes** — it builds a fixed upstream release (3.18 fixed the threading segfaults, 3.19 another, 3.21 a socket-close race plus zero-loss misreporting on lossy UDP) into `/usr/local` and repoints the unit. `run_measurement.sh` now refuses to start below 3.18 and probes the path for 2 s first, so this cannot silently recur |
 | Background load far below requested but non-zero | iperf3 CPU-bound, or the two background ports are not on the pair that shares the inter-switch link | Raise `BG_STREAMS`; check the achieved rate recorded as `background_mbps_achieved` in each `meta.json` and the `LOAD_SHORTFALL` marker files; verify the cabling against §2 |
-| `run_measurement.sh` dies with *background load generator is not delivering traffic* | The 2-second preflight probe delivered < 80 Mbit/s of 100 | Work through the three checks it prints, in order. `SKIP_BG_PREFLIGHT=1` overrides it, but every loaded point will then be worthless |
+| `run_measurement.sh` dies with *background load generator is not delivering traffic* | The 2-second preflight probe delivered < 80 Mbit/s of 100 | Work through the checks it prints, in order. `SKIP_BG_PREFLIGHT=1` overrides it, but every loaded point will then be worthless |
+| `iperf3: error - unable to read from stream socket: Resource temporarily unavailable`, appearing **~30 s** after the command, with the server alive and logging `Server listening on 5201 (test #1)` | Not an iperf3 fault. The client's UDP socket is *connected* to `.72` and PC 2 replies from `.71`, because all four addresses share one `/24` across two interfaces and source-address selection picks the stream port. The kernel discards the reply; the 30 s `SO_RCVTIMEO` on the UDP handshake then expires. TCP is unaffected, which is why the control connection succeeds and only the data path fails. **Do not** chase this in iperf3 — §5.6 has the tcpdump proof | `ip route get <peer bg IP>` on the listener: if it answers `dev enp1s0 src …71`, that is it. `run_measurement.sh` now pins and verifies a `/32` host route on both nodes every run; by hand it is `sudo ip route replace 192.168.1.62/32 dev enp2s0 src 192.168.1.72`. Lost on reboot. Permanent fix: give the background pair its own subnet (§5.6) |
 | Points skipped with `ERROR` | gPTP lost during the run | Check sync stability; look for switch topology changes or link flaps |
 | Background traffic appears on the measurement port | Strict ARP settings lost (e.g. after reboot) | Re-run `setup_node.sh`; see §5.4 |
 | `run_measurement.sh`: "passwordless ssh does not work" | Bootstrap not run, or run as the wrong user | Re-run `bootstrap_ssh.sh` under `sudo` — root's key is the one used |

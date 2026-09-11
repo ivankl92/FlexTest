@@ -551,6 +551,41 @@ marker below 80 % of the requested rate, and `analyze_plot.py` flags a latency
 series that is flat across loads. **The rule this enforces: an experiment must
 verify its stimulus, not only its instrument.**
 
+**Second silent-failure mode, from the same investigation: source-address
+selection.** With iperf3 upgraded to 3.21 the server stopped crashing — and the
+background load still did not flow. The client failed after 30 seconds with
+`unable to read from stream socket: Resource temporarily unavailable`, while the
+server logged a healthy `Server listening on 5201 (test #1)`. A capture on the
+talker resolved it:
+
+```
+enp2s0 Out IP 192.168.1.62.44668 > 192.168.1.72.5201: UDP, length 4
+enp2s0 In  IP 192.168.1.71.5201 > 192.168.1.62.44668: UDP, length 4
+```
+
+The reply carries `.71`, PC 2's **stream** address. All four measurement
+addresses sit in one `192.168.1.0/24` across two interfaces per node, so the
+kernel holds two equal-cost routes for that prefix and resolves the tie by
+interface index — `ip route get 192.168.1.62` on PC 2 returned `dev enp1s0 src
+192.168.1.71`. iperf3's UDP handshake (`iperf_udp_connect()`) waits on a socket
+*connected* to `.72` with a 30 s `SO_RCVTIMEO`; a datagram from `.71` is
+discarded by the kernel before iperf3 sees it.
+
+Two things make this worth recording rather than just fixing. First, the
+existing mitigation was **incomplete in a way that looked complete**: §5.4's
+`arp_filter`/`arp_ignore`/`arp_announce` settings were applied, verified, and
+correct — but they govern *who answers ARP*, not which source address a
+locally-originated packet carries. That is a separate route lookup, and nothing
+in the strict-ARP family touches it. Second, TCP is immune, because an accepted
+socket's addresses are fixed by the handshake — so the control connection
+worked, the server looked healthy, and every symptom pointed at iperf3.
+
+Fixed by a `/32` host route with an explicit `src`, which wins on longest-prefix
+match; `run_measurement.sh` installs and verifies it on both nodes at the start
+of every campaign, because like the sysctls it is runtime state lost on reboot.
+The structural fix, recommended in RUNBOOK §5.6, is to give the background pair
+its own subnet so the ambiguity cannot arise.
+
 **Ranked unknowns.** #1, #2 and #3 are now answered on the real hardware. #4 and
 #5 remain open — and #4 is the one that determines whether the experiment has
 anything to show.

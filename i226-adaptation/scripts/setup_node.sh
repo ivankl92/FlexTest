@@ -15,6 +15,7 @@ STREAM_IF=""
 BG_IF=""
 STREAM_IP=""
 BG_IP=""
+PEER_BG_IP=""
 ROLE="both"
 CONFIG_IP=1
 INSTALL_DIR="/opt/tsn-flextest"
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
     --bg-if)     BG_IF="$2";     shift 2;;
     --stream-ip) STREAM_IP="$2"; shift 2;;
     --bg-ip)     BG_IP="$2";     shift 2;;
+    --peer-bg-ip) PEER_BG_IP="$2"; shift 2;;
     --role)      ROLE="$2";      shift 2;;
     --no-ip-config) CONFIG_IP=0; shift;;
     *) die "unknown argument: $1";;
@@ -156,6 +158,51 @@ done
 sysctl -qw net.ipv4.conf.all.arp_filter=1
 sysctl -qw net.ipv4.conf.all.arp_announce=2
 sysctl -qw net.ipv4.conf.all.arp_ignore=1
+
+# --- source-address selection, which the sysctls above do NOT fix -----------
+# The strict-ARP settings govern who answers ARP. They say nothing about which
+# SOURCE ADDRESS the kernel puts on a locally-originated reply, and that is a
+# separate decision made by a route lookup. With two addresses of the same /24
+# on two interfaces there are two equal-cost routes for that prefix, the kernel
+# picks the lower ifindex - the STREAM interface - and every reply leaves with
+# the stream address as its source.
+#
+# Measured symptom: iperf3's UDP handshake. The client sends UDP_CONNECT_MSG to
+# 192.168.1.72:5201 and waits on a socket CONNECTED to .72. The server replies
+# from .71, the kernel discards a datagram from the wrong peer before iperf3
+# sees it, the 30 s SO_RCVTIMEO fires, and the client dies with "unable to read
+# from stream socket: Resource temporarily unavailable". TCP is unaffected,
+# because an accepted socket's addresses are already fixed by the handshake -
+# so the control connection works and only the data path fails, which is what
+# makes this look like an iperf3 bug rather than a routing one.
+#
+#   tcpdump proof:
+#     enp2s0 Out IP 192.168.1.62.44668 > 192.168.1.72.5201: UDP, length 4
+#     enp2s0 In  IP 192.168.1.71.5201 > 192.168.1.62.44668: UDP, length 4
+#                    ^^^^^^^^^^^^ should be .72
+#
+# A /32 host route to the peer's background address, carrying an explicit src,
+# beats the /24 on longest-prefix match and settles both the outgoing interface
+# and the source address.
+if [[ -n "$PEER_BG_IP" && -n "$BG_IP" ]]; then
+  ip route replace "${PEER_BG_IP%%/*}/32" dev "$BG_IF" src "${BG_IP%%/*}"
+  log "  pinned route to peer ${PEER_BG_IP%%/*} via $BG_IF src ${BG_IP%%/*}"
+  log "    $(ip route get "${PEER_BG_IP%%/*}" | head -1)"
+elif [[ -n "$STREAM_IP" && -n "$BG_IP" ]] && \
+     python3 - "$STREAM_IP" "$BG_IP" <<'PY'
+import ipaddress, sys
+a = ipaddress.ip_interface(sys.argv[1]).network
+b = ipaddress.ip_interface(sys.argv[2]).network
+sys.exit(0 if a == b else 1)
+PY
+then
+  warn "  $STREAM_IF and $BG_IF are both in the same subnet."
+  warn "  Source-address selection for that prefix is then decided by interface"
+  warn "  index, not by which port you meant - replies can leave with the wrong"
+  warn "  source address and UDP peers will silently drop them."
+  warn "  Pass --peer-bg-ip <other node's background IP> so this script can pin"
+  warn "  a host route, or give the background pair its own subnet."
+fi
 
 # ---------------------------------------------------------------------------
 log "4/7 writing gPTP (IEEE 802.1AS) configuration"

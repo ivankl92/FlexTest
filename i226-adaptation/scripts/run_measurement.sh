@@ -92,9 +92,47 @@ for V in "$IPERF3_VER" "$PC2_IPERF3_VER"; do
   fi
 done
 
-# A version check is necessary but not sufficient - the service can be down,
-# the bg ports can be on the wrong switch ports, the address can be stale. Two
-# seconds of real traffic settles all of it.
+# --- source-address selection on the background pair ------------------------
+# All four measurement addresses live in one /24 across two interfaces per
+# node, so the kernel has two equal-cost routes for that prefix and picks by
+# interface index - the stream port - for anything it originates. The reply to
+# an iperf3 UDP handshake then leaves with the STREAM address as its source,
+# the client's connected UDP socket discards it, and the test dies 30 s later
+# with "unable to read from stream socket: Resource temporarily unavailable"
+# even though the TCP control connection worked perfectly. The strict-ARP
+# sysctls do not cover this: they decide who answers ARP, not which source
+# address a locally-originated packet carries.
+#
+# A /32 host route with an explicit src wins on longest-prefix match. Install
+# it on both nodes and verify, every run - it is runtime state and does not
+# survive a reboot.
+pin_bg_route() {          # $1 = "local"|"remote"
+  local dst src ifc got
+  if [[ "$1" == "local" ]]; then
+    dst="$PC2_BG_IP"; src="$PC1_BG_IP"; ifc="$PC1_BG_IF"
+    ip route replace "${dst}/32" dev "$ifc" src "$src" 2>/dev/null || true
+    got=$(ip route get "$dst" 2>/dev/null | head -1)
+  else
+    dst="$PC1_BG_IP"; src="$PC2_BG_IP"; ifc="$PC2_BG_IF"
+    $RSH "$PC2" "sudo ip route replace ${dst}/32 dev ${ifc} src ${src}" 2>/dev/null || true
+    got=$($RSH "$PC2" "ip route get ${dst}" 2>/dev/null | head -1)
+  fi
+  if [[ "$got" != *"dev ${ifc}"* || "$got" != *"src ${src}"* ]]; then
+    warn "  $1 route to ${dst} is still wrong: ${got:-<no answer>}"
+    warn "  expected: dev ${ifc} src ${src}"
+    return 1
+  fi
+  log "  $1 route OK: ${got}"
+  return 0
+}
+BG_ROUTE_OK=1
+pin_bg_route local  || BG_ROUTE_OK=0
+pin_bg_route remote || BG_ROUTE_OK=0
+(( BG_ROUTE_OK == 1 )) || warn "  background traffic may leave via the measurement port - see RUNBOOK 5.6"
+
+# A version check and a route check are necessary but not sufficient - the
+# service can be down, the bg ports can be on the wrong switch ports, the
+# address can be stale. Two seconds of real traffic settles all of it.
 if [[ "${SKIP_BG_PREFLIGHT:-0}" != "1" ]]; then
   log "  probing background path ${PC1_BG_IP} -> ${PC2_BG_IP} for 2 s"
   PROBE_ERR=$(mktemp)
