@@ -66,6 +66,60 @@ BG_SPEED=$(cat "/sys/class/net/${PC1_BG_IF}/speed" 2>/dev/null || echo 1000)
 log "  background port link rate: ${BG_SPEED} Mbit/s"
 
 # ---------------------------------------------------------------------------
+# Background-load preflight.
+#
+# Everything else in this script fails loudly. An absent background load does
+# not: the stream is still sent, still timestamped, still analysed, and every
+# load point returns the unloaded floor. The campaign then reads as "load has
+# no effect on latency", which is a conclusion rather than an error, and it is
+# wrong. So prove the generator works before spending half an hour on it.
+#
+# The known offender is iperf 3.16 (the release that made iperf3
+# multi-threaded, shipped with thread-lifetime bugs): the server takes SIGSEGV
+# the moment a UDP test connects. Ubuntu 24.04 LTS ships exactly that version.
+# scripts/fix_iperf3.sh installs a fixed upstream release into /usr/local.
+IPERF3=$(command -v iperf3 || true)
+[[ -x /usr/local/bin/iperf3 ]] && IPERF3=/usr/local/bin/iperf3
+[[ -n "$IPERF3" ]] || die "iperf3 not found on PC1"
+IPERF3_VER=$("$IPERF3" -v 2>&1 | head -1 | awk '{print $2}')
+PC2_IPERF3_VER=$($RSH "$PC2" 'B=$(command -v iperf3); [ -x /usr/local/bin/iperf3 ] && B=/usr/local/bin/iperf3; "$B" -v 2>&1 | head -1 | awk "{print \$2}"' 2>/dev/null || echo "?")
+log "  iperf3: PC1 $IPERF3_VER ($IPERF3), PC2 $PC2_IPERF3_VER"
+for V in "$IPERF3_VER" "$PC2_IPERF3_VER"; do
+  if [[ "$V" != "?" ]] && ! printf '%s\n%s\n' "3.18" "$V" | sort -V -C; then
+    warn "  iperf3 $V segfaults on UDP tests (fixed upstream in 3.18/3.19/3.21)."
+    warn "  Run 'sudo ${SCRIPT_DIR}/fix_iperf3.sh' on BOTH nodes."
+    [[ "${ALLOW_OLD_IPERF3:-0}" == "1" ]] || die "refusing to run a campaign whose background load cannot work"
+  fi
+done
+
+# A version check is necessary but not sufficient - the service can be down,
+# the bg ports can be on the wrong switch ports, the address can be stale. Two
+# seconds of real traffic settles all of it.
+if [[ "${SKIP_BG_PREFLIGHT:-0}" != "1" ]]; then
+  log "  probing background path ${PC1_BG_IP} -> ${PC2_BG_IP} for 2 s"
+  PROBE=$("$IPERF3" -c "$PC2_BG_IP" -B "$PC1_BG_IP" -u -b 100M -l "$BG_DGRAM" \
+            -P "$BG_STREAMS" -t 2 --json 2>/dev/null || true)
+  PROBE_MBPS=$(printf '%s' "$PROBE" | python3 -c '
+import json,sys
+try:
+    end = json.load(sys.stdin)["end"]
+    s = end.get("sum") or end.get("sum_sent") or {}
+    print(round(s.get("bits_per_second", 0) / 1e6))
+except Exception:
+    print(0)' 2>/dev/null || echo 0)
+  if (( ${PROBE_MBPS:-0} < 80 )); then
+    warn "  background probe delivered ${PROBE_MBPS:-0} of 100 Mbit/s."
+    warn "  Check, in this order:"
+    warn "    ssh ${PC2} 'systemctl status iperf3-bg.service'   (status=11/SEGV => fix_iperf3.sh)"
+    warn "    ip -br addr show ${PC1_BG_IF}   and the same for ${PC2_BG_IF} on PC2"
+    warn "    that both background ports are on the switch pair that shares the inter-switch link"
+    warn "  Set SKIP_BG_PREFLIGHT=1 to run anyway (all loaded points will be meaningless)."
+    die "background load generator is not delivering traffic"
+  fi
+  log "  background probe OK: ${PROBE_MBPS} Mbit/s"
+fi
+
+# ---------------------------------------------------------------------------
 ptp_offset() {   # $1 = "local" | "remote"
   local cmd="pmc -u -b 0 -f /etc/linuxptp/gPTP.cfg 'GET CURRENT_DATA_SET'"
   local out
@@ -249,7 +303,7 @@ for QOS in $QOS_MODES; do
     # 2. background load on the second port pair (shares the inter-switch link)
     IPERFPID=""
     if (( MBPS > 0 )); then
-      iperf3 -c "$PC2_BG_IP" -B "$PC1_BG_IP" -u -b "${PER_STREAM}M" -l "$BG_DGRAM" \
+      "$IPERF3" -c "$PC2_BG_IP" -B "$PC1_BG_IP" -u -b "${PER_STREAM}M" -l "$BG_DGRAM" \
              -P "$BG_STREAMS" -t $((STREAM_DURATION + 6)) --json \
              >"${CASE_DIR}/iperf3.json" 2>"${CASE_DIR}/iperf3.err" &
       IPERFPID=$!
@@ -275,6 +329,34 @@ for QOS in $QOS_MODES; do
     $RSH "$PC2" "sudo rm -f /tmp/rx_${LABEL}.csv" || true
 
     check_ptp || true
+
+    # Requested background load is not delivered background load. If iperf3
+    # achieves far less than asked - server down, wrong path, switch dropping
+    # it - the measured stream sees no congestion at all and every load point
+    # returns the unloaded floor. That looks like a result ("load has no
+    # effect") but is an absent stimulus. Read back what iperf3 actually did.
+    ACHIEVED_MBPS=0
+    if (( MBPS > 0 )) && [[ -s "${CASE_DIR}/iperf3.json" ]]; then
+      ACHIEVED_MBPS=$(python3 - "${CASE_DIR}/iperf3.json" <<'PY' 2>/dev/null || echo 0
+import json, sys
+try:
+    end = json.load(open(sys.argv[1]))["end"]
+    s = end.get("sum") or end.get("sum_sent") or {}
+    print(round(s.get("bits_per_second", 0) / 1e6))
+except Exception:
+    print(0)
+PY
+)
+      ACHIEVED_MBPS=${ACHIEVED_MBPS:-0}
+      if (( ACHIEVED_MBPS * 100 < MBPS * 80 )); then
+        warn "  background load achieved ${ACHIEVED_MBPS} of ${MBPS} Mbit/s requested (<80%)"
+        warn "  the stream is not being congested as intended - check iperf3.err,"
+        warn "  the iperf3-bg service on PC2, and that both bg ports share the inter-switch link"
+        echo "requested ${MBPS} Mbit/s, achieved ${ACHIEVED_MBPS} Mbit/s" \
+          > "${CASE_DIR}/LOAD_SHORTFALL"
+      fi
+    fi
+
     # TXN/RXN count CSV rows, i.e. recovered timestamps — NOT frames sent.
     # SENT is what tsn_tx actually put on the wire, read back from its own
     # report. Loss must be measured against SENT: dividing by TXN makes a
@@ -298,6 +380,7 @@ for QOS in $QOS_MODES; do
   "vid": ${STREAM_VID},
   "background_load_percent": ${LOAD},
   "background_mbps": ${MBPS},
+  "background_mbps_achieved": ${ACHIEVED_MBPS},
   "background_streams": ${BG_STREAMS},
   "link_speed_mbps": ${BG_SPEED},
   "stream_rate_pps": ${STREAM_RATE},

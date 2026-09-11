@@ -220,6 +220,14 @@ rsync -a /home/ivank/tsn-testbed/i226-adaptation/ ivank@172.16.28.17:/home/ivank
 
 ### 5.3 Run node setup — PC 2 first, then PC 1
 
+Setup will **abort** on both machines if `iperf3` is older than 3.18 (§5.5). On
+a stock Ubuntu 24.04 install it is 3.16, so expect to run this first, on each
+node:
+
+```bash
+sudo /home/ivank/tsn-testbed/i226-adaptation/scripts/fix_iperf3.sh
+```
+
 PC 2 (listener):
 
 ```bash
@@ -255,6 +263,7 @@ Know this before running it on a shared machine, and for teardown (§12).
 | gPTP profile written | `/etc/linuxptp/gPTP.cfg` |
 | Units written & started | `/etc/systemd/system/ptp4l@.service`, `phc2sys@.service`, and on the listener `iperf3-bg.service` |
 | Binaries installed | `/opt/tsn-flextest/{tsn_tx,tsn_rx,qos_config.sh}` |
+| iperf3 version enforced | setup **aborts** if `iperf3` is older than 3.18 (see §5.5). `fix_iperf3.sh` adds `/usr/local/bin/iperf3`, `/usr/local/lib/libiperf.so.0` and `/etc/ld.so.conf.d/iperf3-local.conf`; the distro package is left installed and untouched |
 | IP addresses | added to the two interfaces — **runtime only, lost on reboot** |
 | sysctl | `arp_filter=1`, `arp_announce=2`, `arp_ignore=1`, `rp_filter=0` per interface — **runtime only, lost on reboot** |
 
@@ -263,6 +272,48 @@ Know this before running it on a shared machine, and for teardown (§12).
 > answer ARP for `.72` out of `enp1s0` and route background load onto the
 > measurement port — which invalidates every result while looking completely
 > normal. Persisting these is open item #6 in `REPORT.md`.
+
+### 5.5 iperf3 must be 3.18 or newer
+
+Ubuntu 24.04 LTS ships **iperf 3.16**. That is the release which made iperf3
+multi-threaded — *"Multiple test streams started with `-P/--parallel` will now
+be serviced by different threads"* — and it shipped with thread-lifetime bugs.
+On this testbed the consequence is that the **server segfaults the instant a
+UDP test connects**:
+
+```
+iperf3-bg.service: Main process exited, code=dumped, status=11/SEGV
+iperf3-bg.service: Failed with result 'core-dump'.
+Scheduled restart job, restart counter is at 14.
+```
+
+while the client reports `unable to read from stream socket: Resource
+temporarily unavailable`.
+
+This failure is dangerous precisely because it is *partial*. gPTP stays locked,
+the measured stream is still sent, still hardware-timestamped, still analysed —
+only the congestion is missing. The campaign completes without an error and
+produces a clean dataset in which latency is identical at 0 %, 50 % and 105 %
+load. That is not "802.1p makes no difference"; it is an experiment with no
+independent variable.
+
+Fix it on **both** nodes before measuring anything:
+
+```bash
+sudo ./scripts/fix_iperf3.sh          # builds 3.21 into /usr/local, repoints the unit
+iperf3 -v                             # expect 3.21, not 3.16
+```
+
+Relevant upstream fixes: **3.18** — several threading segfaults (#1801,
+#1760/PR#1761, #1750/PR#1752) and a `freeaddrinfo(NULL)` crash (PR#1755);
+**3.19** — a further segfault (#1807); **3.21** — a socket-close race and
+*erroneous zero-loss reporting in lossy UDP tests*, which matters here because
+`run_measurement.sh` reads the achieved background rate back out of iperf3's
+JSON. 3.18 is the floor, 3.21 the recommendation.
+
+`setup_node.sh` now refuses to complete below 3.18, and `run_measurement.sh`
+checks both nodes' versions *and* sends 2 seconds of real UDP down the
+background path before the campaign starts.
 
 ---
 
@@ -563,7 +614,9 @@ indexed by priority, and its value is the traffic class.
 | `tsn_tx` warns on low timestamp yield | I226 TX-timestamp registers saturating | Lower `STREAM_RATE` to 500 or 200 |
 | Latency negative or absurd | PHCs not on a common time base | Re-check gate B on both PCs; a small constant bias is normal |
 | Latency plausible but identical in both QoS modes | Switch not applying strict priority on PCP | Check the KSwitch PCP→traffic-class mapping and scheduler. **Report this as a finding** |
-| Background load far below requested | iperf3 CPU-bound | Raise `BG_STREAMS`; report achieved load from `iperf3.json` |
+| **Latency is the same at every load, to the last 0.01 µs** (e.g. 13.14 µs at 0 %, 50 % and 105 %), and `iperf3.err` contains *unable to read from stream socket: Resource temporarily unavailable* | **The background load generator is dead and nothing else is.** The stream is still sent, timestamped and analysed, so the campaign produces a clean, plausible, entirely meaningless dataset. The usual cause on Ubuntu 24.04 is **iperf 3.16**: that release made iperf3 multi-threaded and shipped thread-lifetime bugs with it, and the *server* takes SIGSEGV as soon as a UDP test connects. Confirm on the listener: `journalctl -u iperf3-bg -n 30` shows `Main process exited, code=dumped, status=11/SEGV` and a climbing `restart counter` | `sudo scripts/fix_iperf3.sh` **on both nodes** — it builds a fixed upstream release (3.18 fixed the threading segfaults, 3.19 another, 3.21 a socket-close race plus zero-loss misreporting on lossy UDP) into `/usr/local` and repoints the unit. `run_measurement.sh` now refuses to start below 3.18 and probes the path for 2 s first, so this cannot silently recur |
+| Background load far below requested but non-zero | iperf3 CPU-bound, or the two background ports are not on the pair that shares the inter-switch link | Raise `BG_STREAMS`; check the achieved rate recorded as `background_mbps_achieved` in each `meta.json` and the `LOAD_SHORTFALL` marker files; verify the cabling against §2 |
+| `run_measurement.sh` dies with *background load generator is not delivering traffic* | The 2-second preflight probe delivered < 80 Mbit/s of 100 | Work through the three checks it prints, in order. `SKIP_BG_PREFLIGHT=1` overrides it, but every loaded point will then be worthless |
 | Points skipped with `ERROR` | gPTP lost during the run | Check sync stability; look for switch topology changes or link flaps |
 | Background traffic appears on the measurement port | Strict ARP settings lost (e.g. after reboot) | Re-run `setup_node.sh`; see §5.4 |
 | `run_measurement.sh`: "passwordless ssh does not work" | Bootstrap not run, or run as the wrong user | Re-run `bootstrap_ssh.sh` under `sudo` — root's key is the one used |
@@ -598,11 +651,12 @@ Before treating a campaign as citable, record:
 - [ ] `config.conf.used` from the run directory
 - [ ] Kernel and `igc` driver version on both PCs (`uname -a`, `ethtool -i enp1s0`)
 - [ ] `linuxptp` version (`ptp4l -v`)
+- [ ] `iperf3` version on **both** PCs (`iperf3 -v`) — 3.16/3.17 produce a silently absent background load (§5.5)
 - [ ] `ethtool -T enp1s0` output from both PCs
 - [ ] KSwitch firmware version and the gPTP / PCP-mapping / scheduler configuration of both switches
 - [ ] gPTP offset range observed during the campaign (`meta.json`, `ptp_before` / `ptp_after`)
 - [ ] TX-timestamp yield per point (`tx.log`) and confirmation that no row has `ts_src=sw`
-- [ ] Achieved versus requested background load per point
+- [ ] Achieved versus requested background load per point (`background_mbps_achieved` in each `meta.json`; no `LOAD_SHORTFALL` files present)
 - [ ] Any points skipped, and why
 - [ ] Confirmation that `summary.csv` shows `data_source=measured`, not `SYNTHETIC_FIXTURE`
 

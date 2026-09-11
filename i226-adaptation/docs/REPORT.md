@@ -518,6 +518,39 @@ plotted or interpreted — `analyze_plot.py` has still only ever run against the
 synthetic fixture. Nothing here says whether 802.1p makes a measurable
 difference on this hardware; that is what the full campaign is for.
 
+**Silent-failure mode found and closed: a dead background-load generator.** A
+campaign run with 802.1Q disabled on the switch returned a median latency of
+13.14 µs at 0 %, 50 % *and* 105 % background load — identical to within 0.01 µs,
+i.e. the unloaded floor at every point. The obvious reading ("load has no
+effect") was wrong. The listener's journal showed, on every accepted
+connection:
+
+```
+iperf3-bg.service: Main process exited, code=dumped, status=11/SEGV
+iperf3-bg.service: Failed with result 'core-dump'.
+Scheduled restart job, restart counter is at 14.
+```
+
+Ubuntu 24.04 ships **iperf 3.16**, the release that made iperf3 multi-threaded,
+and its thread-lifetime bugs kill the server as soon as a UDP test attaches.
+Upstream fixed these in 3.18 (#1801, #1760, #1750, PR#1755), 3.19 (#1807) and
+3.21 (a socket-close race, and erroneous zero-loss reporting on lossy UDP tests
+— which this harness reads back out of iperf3's JSON).
+
+The methodological point generalises beyond iperf3. Every *other* component
+here fails loudly: ptp4l goes FAULTY, `tsn_tx` reports a timestamp shortfall,
+the preflight counts frames. The load generator was the one part whose failure
+left the pipeline producing well-formed, self-consistent, plausible numbers —
+and a plausible number is far more dangerous than an error. Three defences were
+added rather than one: `fix_iperf3.sh` (builds a fixed release into
+`/usr/local`), a version gate in `setup_node.sh` and `run_measurement.sh` that
+refuses anything below 3.18 on either node, and a 2-second live UDP probe of the
+background path before a campaign starts. `run_measurement.sh` additionally
+records `background_mbps_achieved` per point and writes a `LOAD_SHORTFALL`
+marker below 80 % of the requested rate, and `analyze_plot.py` flags a latency
+series that is flat across loads. **The rule this enforces: an experiment must
+verify its stimulus, not only its instrument.**
+
 **Ranked unknowns.** #1, #2 and #3 are now answered on the real hardware. #4 and
 #5 remain open — and #4 is the one that determines whether the experiment has
 anything to show.

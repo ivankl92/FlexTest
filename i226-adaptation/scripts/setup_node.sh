@@ -49,6 +49,44 @@ apt-get install -y --no-install-recommends \
   git ca-certificates chrony >/dev/null
 log "packages installed: $(ptp4l -v 2>&1 | head -1)"
 
+# --- iperf3 version gate ----------------------------------------------------
+# iperf 3.16 made iperf3 multi-threaded and shipped thread-lifetime bugs with
+# it. On this hardware the server takes SIGSEGV the moment a UDP test connects
+# (journal: "Main process exited, code=dumped, status=11/SEGV"), the client
+# reports "unable to read from stream socket: Resource temporarily
+# unavailable", and no background traffic ever reaches the link. Nothing else
+# fails: the stream is still sent, still timestamped, still analysed - so every
+# load point silently returns the unloaded floor and the campaign reads as
+# "background load has no effect on latency". A whole afternoon of measurement
+# can be lost to it, which is why this is a hard stop and not a warning.
+#
+# Upstream fixed the threading segfaults in 3.18 (#1801, #1760, #1750),
+# another in 3.19 (#1807), and in 3.21 a socket-close race plus erroneous
+# zero-loss reporting on lossy UDP tests - which matters because
+# run_measurement.sh reads the achieved background rate out of iperf3's JSON.
+# Ubuntu 24.04 LTS ships 3.16 and there is no fixed package for it.
+IPERF3_BIN=$(command -v iperf3 || true)
+[[ -x /usr/local/bin/iperf3 ]] && IPERF3_BIN=/usr/local/bin/iperf3
+[[ -n "$IPERF3_BIN" ]] || die "iperf3 not installed"
+IPERF3_VER=$("$IPERF3_BIN" -v 2>&1 | head -1 | awk '{print $2}')
+if printf '%s\n%s\n' "3.18" "$IPERF3_VER" | sort -V -C; then
+  log "  iperf3 $IPERF3_VER at $IPERF3_BIN"
+  if printf '%s\n%s\n' "3.21" "$IPERF3_VER" | sort -V -C; then :; else
+    warn "  iperf3 $IPERF3_VER is usable; 3.21+ additionally fixes zero-loss"
+    warn "  misreporting on lossy UDP tests, which this campaign reads back"
+  fi
+elif [[ "${ALLOW_OLD_IPERF3:-0}" == "1" ]]; then
+  warn "  iperf3 $IPERF3_VER is known to crash on UDP - continuing because"
+  warn "  ALLOW_OLD_IPERF3=1. Background load will probably be absent."
+else
+  warn "iperf3 $IPERF3_VER ($IPERF3_BIN) is a known-broken release: the server"
+  warn "segfaults on UDP tests, so background load never reaches the link and"
+  warn "every load point returns the unloaded floor without any error."
+  die "fix it first:  sudo $SRC_DIR/scripts/fix_iperf3.sh   (run on both nodes)
+     then re-run this script. To proceed anyway, with no background load,
+     prefix this command with ALLOW_OLD_IPERF3=1 and use 'sudo -E'."
+fi
+
 # chrony would fight phc2sys for CLOCK_REALTIME; gPTP must own the clock.
 if systemctl is-enabled --quiet chrony 2>/dev/null; then
   log "disabling chrony (it would fight phc2sys for the system clock)"
@@ -233,14 +271,16 @@ log "  installed $INSTALL_DIR/{tsn_tx,tsn_rx,qos_config.sh}"
 # ---------------------------------------------------------------------------
 log "6/7 background-traffic service (listener side)"
 if [[ "$ROLE" == "listener" || "$ROLE" == "both" ]]; then
-  cat >/etc/systemd/system/iperf3-bg.service <<'EOF'
+  # $IPERF3_BIN, not a hard-coded /usr/bin/iperf3: fix_iperf3.sh installs a
+  # current upstream build into /usr/local/bin, and the unit must follow it.
+  cat >/etc/systemd/system/iperf3-bg.service <<EOF
 [Unit]
 Description=iperf3 server for TSN-FlexTest background load
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/iperf3 -s -p 5201
+ExecStart=${IPERF3_BIN} -s -p 5201
 Restart=always
 RestartSec=2
 
@@ -248,8 +288,16 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now iperf3-bg.service
-  log "  iperf3 server running"
+  # Restart=always in front of a binary that segfaults on every connection
+  # leaves the unit with a large restart counter and eventually in a failed
+  # state that enable/start alone will not clear.
+  systemctl reset-failed iperf3-bg.service 2>/dev/null || true
+  systemctl enable iperf3-bg.service >/dev/null 2>&1 || true
+  systemctl restart iperf3-bg.service
+  sleep 1
+  systemctl is-active --quiet iperf3-bg.service \
+    && log "  iperf3 server running: ${IPERF3_BIN} $("$IPERF3_BIN" -v 2>&1 | head -1 | awk '{print $2}')" \
+    || warn "  iperf3-bg.service is not active - systemctl status iperf3-bg.service"
 fi
 
 # ---------------------------------------------------------------------------

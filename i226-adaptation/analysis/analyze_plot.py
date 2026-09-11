@@ -583,6 +583,20 @@ def main() -> int:
               "confidence interval, and differences between configurations "
               "cannot be separated from run-to-run drift. Set REPETITIONS in "
               "config.conf.", file=sys.stderr)
+    # A load sweep whose latency never moves means the background traffic never
+    # arrived. Say so, because "load has no effect" reads like a result.
+    loaded = [c for c in cases if c["load"] > 0]
+    base = [c for c in cases if c["load"] == 0]
+    if loaded and base:
+        floor = float(np.median(np.concatenate([c["latency_us"] for c in base])))
+        worst = max(float(np.median(c["latency_us"])) for c in loaded)
+        if worst - floor < 0.5:
+            print(f"  !! latency at every load point is within 0.5 us of the unloaded "
+                  f"floor ({floor:.3f} us). The background load is almost certainly not "
+                  f"reaching the shared link: check iperf3.json / iperf3.err in each "
+                  f"point, the iperf3-bg service on the listener, and the switch path "
+                  f"between the two background ports.", file=sys.stderr)
+
     for c in cases:
         if c["degraded"]:
             print(f"  !! {c['qos']} @ {c['load']}%: degraded repetition(s) pooled in: "
