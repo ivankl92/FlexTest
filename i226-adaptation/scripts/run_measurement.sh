@@ -97,26 +97,52 @@ done
 # seconds of real traffic settles all of it.
 if [[ "${SKIP_BG_PREFLIGHT:-0}" != "1" ]]; then
   log "  probing background path ${PC1_BG_IP} -> ${PC2_BG_IP} for 2 s"
+  PROBE_ERR=$(mktemp)
   PROBE=$("$IPERF3" -c "$PC2_BG_IP" -B "$PC1_BG_IP" -u -b 100M -l "$BG_DGRAM" \
-            -P "$BG_STREAMS" -t 2 --json 2>/dev/null || true)
-  PROBE_MBPS=$(printf '%s' "$PROBE" | python3 -c '
+            -P "$BG_STREAMS" -t 2 --json 2>"$PROBE_ERR" || true)
+  # Report the rate AND, when there is none, why. A bare "0 Mbit/s" sends you
+  # hunting through the whole path when iperf3 usually says exactly what went
+  # wrong - in --json mode it puts it in an "error" key on stdout, not stderr.
+  read -r PROBE_MBPS PROBE_WHY < <(printf '%s' "$PROBE" | python3 -c '
 import json,sys
+raw = sys.stdin.read()
 try:
-    end = json.load(sys.stdin)["end"]
-    s = end.get("sum") or end.get("sum_sent") or {}
-    print(round(s.get("bits_per_second", 0) / 1e6))
+    d = json.loads(raw)
 except Exception:
-    print(0)' 2>/dev/null || echo 0)
-  if (( ${PROBE_MBPS:-0} < 80 )); then
-    warn "  background probe delivered ${PROBE_MBPS:-0} of 100 Mbit/s."
+    print(0, "iperf3 produced no parseable JSON: " + (raw.strip()[:200] or "(no output)"))
+    raise SystemExit
+if d.get("error"):
+    print(0, "iperf3: " + str(d["error"]))
+    raise SystemExit
+end = d.get("end", {})
+s = end.get("sum") or end.get("sum_sent") or {}
+bps = s.get("bits_per_second", 0)
+lost = s.get("lost_percent")
+why = "" if bps else "test ran but reported no throughput"
+if lost is not None and bps:
+    why = "loss %.1f%%" % lost
+print(round(bps / 1e6), why)' 2>/dev/null || echo "0 probe helper failed")
+  PROBE_MBPS=${PROBE_MBPS:-0}
+  [[ "$PROBE_MBPS" =~ ^[0-9]+$ ]] || PROBE_MBPS=0
+  if (( PROBE_MBPS < 80 )); then
+    warn "  background probe delivered ${PROBE_MBPS} of 100 Mbit/s."
+    # Guard the || true: under `set -e` a false [[ ]] && cmd would abort here
+    # with a bare exit 1 and no message at all.
+    [[ -n "${PROBE_WHY:-}" ]] && warn "  ${PROBE_WHY}" || true
+    [[ -s "$PROBE_ERR" ]] && warn "  stderr: $(head -3 "$PROBE_ERR" | tr '\n' ' ')" || true
     warn "  Check, in this order:"
-    warn "    ssh ${PC2} 'systemctl status iperf3-bg.service'   (status=11/SEGV => fix_iperf3.sh)"
+    warn "    ssh ${PC2} 'systemctl status iperf3-bg.service'   (must be active, listening on 5201)"
+    warn "    ssh ${PC2} 'ss -lunp | grep 5201; ss -ltnp | grep 5201'"
     warn "    ip -br addr show ${PC1_BG_IF}   and the same for ${PC2_BG_IF} on PC2"
+    warn "    sysctl net.ipv4.conf.${PC1_BG_IF}.rp_filter net.ipv4.conf.${PC1_BG_IF}.arp_filter"
+    warn "      -- these are runtime-only and are LOST ON REBOOT; without them"
+    warn "         two interfaces in 192.168.1.0/24 send out of the wrong port"
     warn "    that both background ports are on the switch pair that shares the inter-switch link"
     warn "  Set SKIP_BG_PREFLIGHT=1 to run anyway (all loaded points will be meaningless)."
     die "background load generator is not delivering traffic"
   fi
-  log "  background probe OK: ${PROBE_MBPS} Mbit/s"
+  rm -f "$PROBE_ERR"
+  log "  background probe OK: ${PROBE_MBPS} Mbit/s${PROBE_WHY:+ (${PROBE_WHY})}"
 fi
 
 # ---------------------------------------------------------------------------
