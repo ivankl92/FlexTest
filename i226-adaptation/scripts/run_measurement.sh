@@ -38,9 +38,16 @@ PC2="${PC2_USER}@${PC2_MGMT}"
 RSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
 
 if [[ $QUICK -eq 1 ]]; then
-  BG_LOADS="0 95"
-  STREAM_DURATION=10
-  log "--quick: loads='$BG_LOADS' duration=${STREAM_DURATION}s"
+  # Three loads that each probe something different: 0 % gives the unloaded
+  # floor (the reproducibility check - it lands within ~0.04 us run to run),
+  # 50 % the partially-congested regime, 105 % the oversubscribed one.
+  BG_LOADS="0 50 105"
+  STREAM_DURATION=5
+  # A smoke test answers "does the path work end to end", not "what is the
+  # latency". One pass is enough for that, and repetitions would multiply the
+  # runtime of a check meant to be short.
+  REPETITIONS=1
+  log "--quick: loads='$BG_LOADS' duration=${STREAM_DURATION}s repetitions=1 (smoke test, not a measurement)"
 fi
 
 # ---------------------------------------------------------------------------

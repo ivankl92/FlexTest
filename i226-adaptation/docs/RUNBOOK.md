@@ -304,7 +304,7 @@ ping -c3 -I enp2s0 192.168.1.72
 
 ```bash
 cd /home/ivank/tsn-testbed/i226-adaptation/scripts
-sudo ./run_measurement.sh --quick        # 2 QoS modes × 2 loads × 10 s
+sudo ./run_measurement.sh --quick        # 2 QoS modes × 3 loads (0/50/105 %) × 5 s, 1 repetition
 ```
 
 Require: the preflight passes; `tx=` and `rx=` counts within a few per cent at
@@ -384,7 +384,7 @@ match — the two are a pair.
 ```bash
 cd /home/ivank/tsn-testbed/i226-adaptation/scripts
 sudo ./run_measurement.sh              # full campaign
-sudo ./run_measurement.sh --quick      # smoke test: 2 loads, 10 s each
+sudo ./run_measurement.sh --quick      # smoke test: loads 0/50/105 %, 5 s each, no repetitions (~2.5 min)
 sudo ./run_measurement.sh --config /path/to/other.conf
 ```
 
