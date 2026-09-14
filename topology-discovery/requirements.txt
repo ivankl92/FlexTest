@@ -1,0 +1,10 @@
+# NETCONF topology discovery — runtime dependencies.
+#
+# Pinned to a lower bound rather than an exact version: these are stable,
+# widely packaged libraries and the testbed may already have them from the
+# distribution. Exact pins are in .venv once setup_env.sh has run; record
+# them with `.venv/bin/pip freeze > requirements.lock` if a run needs to be
+# reproduced exactly.
+
+ncclient>=0.6.13
+lxml>=4.9.0
