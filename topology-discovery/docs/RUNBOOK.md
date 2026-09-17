@@ -28,7 +28,7 @@ never been run against a real KSwitch D10.
 - Python 3.8 or newer, with `python3-venv`
   (`sudo apt-get install python3-venv` on Ubuntu).
 - Network access to PyPI for `ncclient` and `lxml` — or the offline
-  procedure in §3.2.
+  procedure in §3.3.
 - `netopeer2-cli` is **optional**. It is already installed in
   `/home/ivank/netopeer2` and preflight will use it as a cross-check, but
   discovery does not need it.
@@ -128,7 +128,31 @@ to be authoritative. This is recorded permanently in the CNC gap list as
 The subproject lives at `tsn-testbed/topology-discovery/`. It is
 self-contained and does not touch `i226-adaptation/`.
 
-### 3.1 Normal install
+### 3.1 Get the current code
+
+```bash
+cd /home/ivank/tsn-testbed
+git pull
+```
+
+The tool and this runbook are versioned together with the rest of the
+testbed, so pull before a setup and before reporting a problem — a mismatch
+between the procedure you are reading and the code you are running is a
+common source of confusion.
+
+A pull will not disturb anything a previous run produced: `results/`,
+`.venv/` and `requirements.lock` are all ignored by the repository. If the
+pull is refused because the working tree has local edits, deal with them
+first:
+
+```bash
+git status --short
+git stash                  # or: git commit -am "local changes"
+git pull
+git stash pop              # if stashed
+```
+
+### 3.2 Normal install
 
 ```bash
 cd /home/ivank/tsn-testbed/topology-discovery
@@ -139,7 +163,7 @@ This creates `.venv/` inside the subproject and installs `ncclient` and
 `lxml` into it. Nothing is installed system-wide. It prints the installed
 versions and `environment OK` on success.
 
-### 3.2 Offline install
+### 3.3 Offline install
 
 If the testbed network has no route to PyPI, fetch the wheels on a machine
 that does:
@@ -155,7 +179,7 @@ WHEELS=/path/to/wheels ./scripts/setup_env.sh
 cryptography, bcrypt, pynacl, cffi, pycparser). Check the Python version
 matches — wheels are version- and ABI-specific.
 
-### 3.3 Record exact versions
+### 3.4 Record exact versions
 
 For a run that must be reproducible later:
 
