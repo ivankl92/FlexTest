@@ -19,7 +19,7 @@ The testbed consists of following devices:
 
 ### Addresses
 
-The davices have following addresses:
+The devices have following addresses:
 
 		IPv4			MAC	
 UP-1	192.168.1.61	00:07:32:C1:43:30
