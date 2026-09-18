@@ -46,7 +46,18 @@ network itself:
 The single most consequential finding is negative and is stated up front in
 §4: **the KSwitch D10's NETCONF server implements no PTP or gPTP YANG
 module.** Qbv schedules can be written; the time base they are anchored to
-cannot be read or verified through NETCONF at all.
+cannot be read or verified through NETCONF at all. Since GA-3.06 the
+NETCONF server does not start on any of the five switches either, so the
+tool reads them over the ISTAX CLI and maps the result onto the same YANG
+shapes (§5.9).
+
+The first live run, on 2026-09-18, reached all five switches and confirmed
+the topology and the gPTP hierarchy. It also corrected six defects in this
+tool that no offline fixture could have caught (§9.1), and turned up two
+findings about the bench itself (§9.2): **no bridge port trusts the incoming
+VLAN tag**, so a Qbv schedule gating traffic classes 1–7 would gate empty
+queues, and **the PCP-to-traffic-class map is not the identity** on any
+port. Both need attention before the first scheduling experiment.
 
 Nothing in this subproject writes to a switch. Discovery is read-only by
 construction — the tool issues only `<get>` and `<get-config>`, and there is
@@ -255,11 +266,48 @@ CNC will look for them.
 Each projection declares its `module`, `revision`, `reference` and
 `namespace`, and carries two honesty lists: `unavailable`, for nodes the
 model defines that the CLI does not print, and `derived`, for values filled
-by inference, each with the inference stated. `as-capable` is the pointed
-example: 802.1AS defines it, the CLI does not print it, and it would be easy
-to fake from the port state. It is left absent, with the reason recorded,
-because a CNC that trusts a fabricated `as-capable` would schedule against a
-time base nobody verified.
+by inference, each with the inference stated.
+
+### 4.2 `as-capable`: a correction
+
+The first version of this section held up `as-capable` as the model case for
+declaring a gap. The argument was that 802.1AS defines it, the CLI does not
+print it, it would be easy to fake from the port state, and a CNC that
+trusted a fabricated `as-capable` would schedule against a time base nobody
+had verified. The argument was sound. The premise was wrong.
+
+`show ptp 0 port-state` prints **three** tables, not two. After the PTP port
+state and the virtual-port table comes one headed `802.1AS port status:`,
+and it has an `as-cap` column:
+
+```
+802.1AS port status:
+Port  port-role  is-mes-del  as-cap  rate-ratio   cur-anv  cur-syv  ...
+----  ---------  ----------  ------  -----------  -------  -------  ...
+   4  Slave      True        True            241        0       -3  ...
+   6  Disabled   False       False             0        0       -3  ...
+```
+
+The collector was parsing the first table and stopping. Worse, it filled
+`is-measuring-delay` from the `Peer-delay` OK/FAIL column of the first
+table — which reports whether the peer delay mechanism is healthy on that
+link, a different assertion — and got it wrong on five of eight ports on
+every switch. So the one leaf that was loudly declared unobtainable was
+printed all along, and the leaf beside it was quietly wrong.
+
+Both are now read from their own columns, along with `port-role`,
+`rate-ratio`, `cur-MPR`, `sync-time-intrv`, the asymmetry and computation
+flags and the 802.1AS version. `mean-link-delay` stays unconverted: the
+`cur-MPR` column carries a bare integer with no unit and reads 0 on every
+port in this testbed, so there is nothing to infer a scale from, and the raw
+value is kept as `mean-link-delay-raw` rather than rescaled on a guess. That
+is what a real gap looks like.
+
+The lesson generalises past this one leaf. "The CLI does not print it" is a
+claim about the CLI, and the only way to hold it is to have read all of the
+output — not the part that answered the first question asked of it. §9
+records this as the reason the offline test fixtures are now verbatim
+captures from all five switches rather than abridged examples.
 
 On top of the datasets, `ptp.lock_assessment()` produces the verification
 gate REPORT §8 previously listed as the highest-value missing piece: a
@@ -703,7 +751,7 @@ explicit statement of which standard knobs this firmware does not expose.
 
 ## 9. Verification status
 
-**Exercised.** 100 offline tests pass
+**Exercised.** 134 offline tests pass
 (`python3 -m unittest discover -s tests`), covering:
 
 - The **live session code path** — `SwitchSession.connect()`, `collect()`,
@@ -745,76 +793,123 @@ derives the hostname, the bridge base address, the management address, all
 eight ports with their speeds and PVIDs, both VLANs, the 28 filtering-database
 entries, the LLDP adjacency to KSwitchTSN-2 on Gi 1/5, and — importantly —
 attaches CTRL to Gi 1/1 while declining to attach the twelve other MACs
-learned through the Gi 1/5 trunk. The PTP, Qbv, Qbu and QoS parsers are
-tested against the worked examples in Microchip AN1185 and AN1295, which is
-real output from Microchip's reference hardware rather than this testbed;
-those fixtures are marked `SYNTHETIC`.
+learned through the Gi 1/5 trunk. Since the
+2026-09-18 run the PTP, Qbv, Qbu and QoS fixtures are verbatim captures from
+KSwitchTSN-2 as well, pager residue and all, so the tests exercise the
+firmware's real output rather than a tidied version of it. One
+`SYNTHETIC` fixture remains, from Microchip AN1185: no port in this testbed
+enables a credit-based shaper, and the `credit: enabled` branch would
+otherwise be untested.
 
 A separate test asserts that the CLI record and the NETCONF record have the
 same keys at every level that downstream code reads. That is the one failure
 mode uniformity has: a drift would not raise, it would silently hand a
 consumer `None`.
 
-**Never executed.** **No NETCONF session has ever been established against a
-KSwitch D10** — and since GA-3.06 none can be, because the server does not
-start. No NETCONF reply has been parsed from real hardware. The CLI
-collector has never been run end to end against a live switch either: its
-parsers are tested against a captured transcript, but the transport itself
-(SSH negotiation, the pager, per-interface command generation, the
-switch-wide-then-per-port strategy) has not met a real session.
-Specifically unverified:
+**Executed against all five switches, 2026-09-18.** The CLI transport met a
+live session for the first time and reached all five switches. Everything
+the previous version of this section listed as unverified about the CLI path
+is now answered:
 
-- **The CLI transport against a live switch.** Whether the `-- more --`
-  pager answers to `g` as the application note says, whether the prompt
-  regex matches every state the CLI can be in, whether the SHA-1 retry is
-  needed or sufficient, and whether `show tsn tas status` without an
-  interface argument is accepted (the tool tries it and falls back to
-  per-interface, so either way works, but the fast path is untested).
-- Whether `show ptp 0 port-state` is accepted without an interface argument.
-  AN1295 only ever shows it with one.
-- Whether port numbering really follows the `show interface * status`
-  ordering on hardware with a different port mix. It is corroborated on this
-  hardware by LLDP reporting Port ID 4 for GigabitEthernet 1/4, and the
-  derivation is labelled in the output rather than presented as read.
-- Whether queue index equals priority index for frame preemption. The CLI
-  configures preemption per queue and `ieee802-dot1q-preemption` models it
-  per priority; the mapping is stated in the record as an assumption that
-  holds under the default 1:1 priority-to-traffic-class map.
+- The `-- more --` pager does answer to `g`, as AN001 says.
+- The prompt regex matched every state on all five switches.
+- `show tsn tas status` and `show ptp 0 port-state` are both accepted
+  without an interface argument, so the fast path works; the per-interface
+  fallback was exercised too, since the collector issues both.
+- Port numbering does follow the `show interface * status` ordering.
+  Independently corroborated three ways per switch: LLDP Port ID, the PTP
+  port numbering, and the filtering-database port references all agree.
+- The SHA-1 retry was not needed; all five negotiated on the modern path.
 
-And, for the NETCONF path, unchanged from before:
+The run also produced three cross-checks the tool had never been able to
+make before, and all three hold. Every switch's bridge address is the EUI-64
+pre-image of its PTP clock identity. All five name the same grandmaster and
+report steps-removed 0,1,2,3,4, which is the daisy chain LLDP independently
+derived. And each switch's parent-port identity is the clock identity of its
+LLDP-discovered upstream neighbour.
 
-- That the NETCONF server is enabled on any of the five switches. AN001 §5 is
-  explicit that it does not start automatically and must be enabled from the
-  ISTAX CLI (`configure terminal` / `netconf server`).
-- That the credentials in `SYSTEM.md` (`netconf` / `geheim`) are correct, and
-  that the SSH key exchange and cipher suites the switches offer are ones
-  paramiko will negotiate. Older embedded SSH stacks sometimes are not.
-- **That LLDP `remote-systems-data` is populated at all.** This is the single
-  largest risk in the subproject. The module is advertised in AN001 v1.2, but
-  the plugin implements only a subset of each module, no implemented-path
-  list is given for LLDP, and no worked example exists. If remote systems
-  data is not populated, no switch-to-switch link can be discovered by this
-  method and §11 of the runbook applies.
-- The exact LLDP tree shape. The parser handles the nested 802.1AB-2016 form
-  and two flattened variants, but this is defensive coding against an
-  unobserved format.
+### 9.1 What the first live run corrected
+
+Six defects the offline fixtures could not have exposed, because every one
+of them was a place where the fixtures encoded an assumption rather than the
+hardware's actual output:
+
+1. **The pager erases its prompt with a run of spaces** and resumes writing
+   on that line, so one row per paged command arrives displaced ~50 columns
+   right. Column-sliced parsing read it as empty and dropped it: one
+   filtering-database entry was lost on SW2. The residue is now recognised
+   by geometry — content beginning past the last column's start that
+   re-aligns into two or more columns when the run is removed — rather than
+   by counting spaces, because `show ptp 0 current` right-aligns a genuine
+   value 31 columns in.
+2. **Column widths are sized to the heading, not the data.**
+   `ParentPortIdentity` gets 22 dashes and holds a 23-character clock
+   identity, so every clock identity lost its last character. Two identities
+   differing only in the last byte would have compared equal. Fields are now
+   sliced from each column's start to the *next* column's start.
+3. **`spanning-tree mst name` is not the bridge address.** It looks like one
+   on a switch nobody has touched, because the firmware seeds it from the
+   MAC. Four of the five here carry `00-22-33-44-55-66`, and that fabricated
+   address reached `capabilities.md` and `topology.md`. The address now
+   comes from the static CPU entry in the filtering database, which is a
+   reading, and the MST name is recorded as what it is. Worth noting
+   separately: SW1 is in a different MST region name from the other four.
+4. **The 802.1AS port status table was never parsed** — see §4.2.
+5. **`show qos interface` was ~95% discarded.** The parser matched only
+   queue shapers. It now reads the whole output, which turned up the two
+   testbed findings below.
+6. **A grandmaster was reported as `locked`.** SW1 reports zero offset and a
+   free-running servo because it *is* the reference; calling that `locked`
+   hands a CNC a verification that never happened. It now gets its own
+   verdict, with its clock class and time source, so the reader can see that
+   this network is disciplined to SW1's local oscillator.
+
+### 9.2 Two findings about the testbed, not the tool
+
+Both came out of the QoS output once it was actually read, and both matter
+before any scheduling experiment:
+
+- **No port trusts the incoming VLAN tag.** All 40 bridge ports carry
+  `qos trust tag disabled` and `qos cos 0`, so every frame is classified to
+  traffic class 0 whatever PCP the talker sets. A gate-control list that
+  opens classes 1–7 would open them onto empty queues. This is
+  configuration, not a capability gap — the hardware supports it — and it is
+  recorded in the CNC gap list as `blocking-for-scheduling`.
+- **The PCP-to-traffic-class map is not the identity.** Uniformly on all 40
+  ports, PCP 0 maps to class 1 and PCP 1 to class 0 — the 802.1Q-recommended
+  default. This invalidated a caveat the Qbu record used to print about
+  holding "under the default 1:1 map". The map is now read per port and
+  applied when expressing per-queue preemption as per-priority preemption.
+
+Also surfaced rather than left silent: four ports (`Gi 1/6` on SW2–SW5) have
+a link with no LLDP neighbour and no filtering-database entry. That is the
+same count as the four Raspberry Pis the inventory cross-check lists as
+unobserved, so they are most likely cabled there and simply silent. The
+tool now reports link-up-but-unidentified ports instead of omitting them.
+
+**Still never executed.** **No NETCONF session has ever been established
+against a KSwitch D10** — and since GA-3.06 none can be, because the server
+does not start. No NETCONF reply has been parsed from real hardware. For the
+NETCONF path, unchanged:
+
+- That the NETCONF server can be enabled at all on GA-3.06. It is present in
+  every switch's running-config and listening on nothing; §4 and §5.9 cover
+  this. On all five, not just SW1 — which is what makes it a firmware
+  regression rather than a per-device mistake.
+- That the credentials in `SYSTEM.md` (`netconf` / `geheim`) are correct.
+- **That LLDP `remote-systems-data` is populated over NETCONF.** The CLI
+  path has now proved LLDP adjacency data exists and is correct; whether the
+  sysrepo plugin exposes it is still unknown.
+- The exact LLDP tree shape over NETCONF.
 - Whether `port-ref` in filtering-database entries maps to
-  `bridge-port/port-number` or to `if-index` on this firmware. Both are
-  tried, `port-number` first; the fixture exercises the case where they
-  coincide, which is the case that hides a mismatch.
-- Whether the frame-preemption model is populated, and in which of the two
-  shapes the parser handles.
-- Whether the five switches are on the same firmware release.
+  `bridge-port/port-number` or to `if-index` on this firmware.
+- Whether the frame-preemption model is populated, and in which shape.
 
-**Conclusion: the NETCONF path is verified against the documented data model
-and cannot currently be verified against the hardware at all. The CLI path
-is verified against real output from this testbed for the commands a
-transcript exists for, and against vendor examples for the rest, but its
-transport has not met a live session.** The first real run
-is a test of the vendor's implementation as much as of this code, which is
-why every reply is captured raw and why `--reanalyse` exists. Expect the
-first run to need one round of parser adjustment, and expect the raw captures
-to be what makes that adjustment possible.
+**Conclusion: the CLI path is now verified end to end against all five
+switches of this testbed, and its offline fixtures are verbatim captures
+from that run rather than abridged examples. The NETCONF path remains
+verified against the documented data model and unverifiable against the
+hardware until Kontron fixes the server.**
 
 ---
 

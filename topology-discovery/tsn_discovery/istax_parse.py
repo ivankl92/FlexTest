@@ -109,10 +109,30 @@ def _spans_from_header(header: str) -> List[Tuple[int, Optional[int]]]:
 
 def _slice_rows(header_line: str, data_lines: List[str],
                 spans: List[Tuple[int, Optional[int]]]) -> List[Dict[str, str]]:
+    # A column's territory runs from its own start to the *next* column's
+    # start, not to the end of its dash group. The firmware sizes the dashes
+    # to the heading, not to the data, and overflows the difference into the
+    # gap: `show ptp 0 parent` gives ParentPortIdentity 22 dashes and then
+    # writes a 23-character clock identity, so slicing to the dash width
+    # silently drops the last character of every clock identity.
+    ends: List[Optional[int]] = []
+    for n, (start, end) in enumerate(spans):
+        if n + 1 < len(spans):
+            ends.append(max(end or 0, spans[n + 1][0]))
+        else:
+            ends.append(None)                     # last column runs on
+
     headers = []
-    for start, end in spans:
+    for (start, _), end in zip(spans, ends):
         headers.append(header_line[start:end].strip() if end
                        else header_line[start:].strip())
+
+    def slice_one(line: str) -> Dict[str, str]:
+        row = {}
+        for (start, _), end, key in zip(spans, ends, headers):
+            value = line[start:end] if end else line[start:]
+            row[key or f"col{start}"] = value.strip()
+        return row
 
     rows: List[Dict[str, str]] = []
     for line in data_lines:
@@ -120,10 +140,24 @@ def _slice_rows(header_line: str, data_lines: List[str],
             continue
         if set(line.strip()) <= set("- "):
             break
-        row = {}
-        for (start, end), key in zip(spans, headers):
-            value = line[start:end] if end else line[start:]
-            row[key or f"col{start}"] = value.strip()
+        row = slice_one(line)
+
+        # Pager residue: the firmware erases its `-- more --` prompt with a
+        # run of spaces and then writes the next row on that same line, so
+        # one row per page arrives pushed ~50 columns to the right. It is
+        # recognised by geometry rather than by counting spaces -- a row
+        # whose content begins past the LAST column's start, and which
+        # re-aligns into two or more columns once the run is removed, was
+        # displaced. Indentation alone would not do: `show ptp 0 current`
+        # right-aligns a genuine value 31 columns in.
+        if len(spans) > 1 and line[:spans[-1][0]].strip() == "":
+            candidate = line.lstrip()
+            if candidate:
+                realigned = slice_one(candidate)
+                if sum(1 for v in realigned.values() if v) > \
+                        sum(1 for v in row.values() if v):
+                    row = realigned
+
         if any(row.values()):
             rows.append(row)
     return rows
@@ -339,7 +373,7 @@ def parse_running_config(text: Optional[str]) -> dict:
     """Split `show running-config` into the parts the record needs."""
     cfg: dict = {
         "hostname": None,
-        "bridge_address": None,
+        "mst_region_name": None,
         "management_ip": None,
         "vlans_declared": [],
         "netconf_server_configured": False,
@@ -383,12 +417,16 @@ def parse_running_config(text: Optional[str]) -> dict:
         if m:
             cfg["hostname"] = m.group(1)
             continue
-        # `spanning-tree mst name 00-80-82-b9-65-33` carries the bridge base
-        # MAC on this platform -- the same value NETCONF reports as
-        # ieee802-dot1q-bridge/bridge/address.
+        # `spanning-tree mst name 00-80-82-b9-65-33` LOOKS like the bridge
+        # base MAC, and on a switch nobody has touched it is one -- the
+        # firmware seeds the MST region name from it. It is still only a
+        # region name: four of the five switches in this testbed carry
+        # `00-22-33-44-55-66`, which is not any of their addresses. So it is
+        # recorded as what it is, and the bridge address is taken from the
+        # static CPU entry in the filtering database instead.
         m = re.match(r"^spanning-tree mst name\s+(\S+)", stripped, re.I)
-        if m and norm_mac(m.group(1)):
-            cfg["bridge_address"] = norm_mac(m.group(1))
+        if m:
+            cfg["mst_region_name"] = m.group(1)
             continue
         m = re.match(r"^vlan\s+([\d,\-]+)\s*$", stripped, re.I)
         if m:
@@ -562,6 +600,24 @@ def parse_tas_config_lines(lines: List[str]) -> dict:
 
 # --- Qbv / Qbu / QoS status ---------------------------------------------
 
+def _tick_granularity(value: Optional[str]) -> Optional[int]:
+    """`TickGranularity : 1 tenths of nanoseconds`.
+
+    802.1Q's tick-granularity leaf is already expressed in tenths of a
+    nanosecond, so when the firmware names that unit the leading integer is
+    the value. Any other unit is left unread rather than silently rescaled.
+    """
+    if not value:
+        return None
+    m = re.match(r"^\s*(\d+)\s*(.*)$", value)
+    if not m:
+        return None
+    unit = m.group(2).strip().lower()
+    if not unit or unit.startswith("tenths of nanosecond"):
+        return to_int(m.group(1))
+    return None
+
+
 def _tas_status_to_qbv(block: Dict[str, str], config_lines: List[str]) -> dict:
     """`show tsn tas status` + running-config -> the qbv shape."""
     gcl: List[dict] = []
@@ -620,7 +676,12 @@ def _tas_status_to_qbv(block: Dict[str, str], config_lines: List[str]) -> dict:
         "oper_base_time_ns": _seconds_nanos_ns(block.get("OperBaseTime")),
         "config_change_time_ns": _seconds_nanos_ns(block.get("ConfigChangeTime")),
         "current_time_ns": _seconds_nanos_ns(block.get("CurrentTime")),
-        "tick_granularity": to_int(block.get("TickGranularity")),
+        # "1 tenths of nanoseconds" -- the number and its unit share the
+        # field, so to_int() on the whole string yields nothing. 802.1Q's
+        # tick-granularity is in tenths of a nanosecond, which is the unit
+        # the firmware is already printing, so the leading integer is the
+        # value; anything else is left unread rather than converted blind.
+        "tick_granularity": _tick_granularity(block.get("TickGranularity")),
         "admin_control_list_length": admin["admin_control_list_length"],
         "oper_control_list_length": to_int(block.get("OperControlListLength")),
         "admin_control_list": admin["admin_control_list"],
@@ -657,12 +718,54 @@ def _tas_status_to_qbv(block: Dict[str, str], config_lines: List[str]) -> dict:
 
 
 def _fp_status_to_qbu(block: Dict[str, str],
-                      preemptable_queues: List[int]) -> dict:
-    """`show tsn frame-preemption status` + running-config -> the qbu shape."""
+                      preemptable_queues: List[int],
+                      priority_regeneration: Optional[Dict[str, int]] = None
+                      ) -> dict:
+    """`show tsn frame-preemption status` + running-config -> the qbu shape.
+
+    The CLI configures preemption per egress QUEUE; `ieee802-dot1q-preemption`
+    expresses it per PRIORITY. Those are the same thing only when the port's
+    priority regeneration map is the identity, and on this hardware it is
+    not: the 802.1Q-recommended default swaps PCP 0 and PCP 1. So the map is
+    read from `show qos interface` and applied, rather than assumed.
+    """
+    queue_of_priority = {p: p for p in range(8)}
+    mapping_is_identity = True
+    if priority_regeneration:
+        mapping_is_identity = all(int(p) == q for p, q
+                                  in priority_regeneration.items())
+        for p, q in priority_regeneration.items():
+            queue_of_priority[int(p)] = q
+
     status = {}
-    for q in range(8):
-        status[f"priority{q}"] = ("preemptable" if q in preemptable_queues
-                                  else "express")
+    for p in range(8):
+        status[f"priority{p}"] = (
+            "preemptable" if queue_of_priority[p] in preemptable_queues
+            else "express")
+    preemptable_priorities = [f"priority{p}" for p in range(8)
+                              if queue_of_priority[p] in preemptable_queues]
+
+    if priority_regeneration is None:
+        note = ("Preemption is configured per egress queue and reported here "
+                "per priority. The port's priority regeneration map was not "
+                "read, so queue N is reported as priorityN -- correct only if "
+                "the map is the identity. Read `show qos interface` to "
+                "confirm.")
+    elif mapping_is_identity:
+        note = ("Preemption is configured per egress queue and reported here "
+                "per priority, using this port's priority regeneration map "
+                "from `show qos interface`, which is the identity.")
+    else:
+        swapped = ", ".join(f"priority {p} -> queue {q}" for p, q
+                            in sorted(((int(k), v) for k, v
+                                       in priority_regeneration.items()))
+                            if int(p) != q)
+        note = ("Preemption is configured per egress queue and reported here "
+                "per priority, using this port's priority regeneration map "
+                f"from `show qos interface`, which is NOT the identity "
+                f"({swapped}). Reading queue N as priority N would report "
+                "these priorities wrongly.")
+
     return {
         "present": True,
         "capability": {
@@ -674,52 +777,217 @@ def _fp_status_to_qbu(block: Dict[str, str],
         },
         "configuration": {
             "frame_preemption_status": status,
-            "preemptable_priorities": [f"priority{q}"
-                                       for q in sorted(preemptable_queues)],
-            "express_priorities": [f"priority{q}" for q in range(8)
-                                   if q not in preemptable_queues],
+            "preemptable_priorities": preemptable_priorities,
+            "express_priorities": [f"priority{p}" for p in range(8)
+                                   if f"priority{p}" not in
+                                   preemptable_priorities],
             "preemptable_queues": sorted(preemptable_queues),
+            "priority_regeneration_applied": priority_regeneration,
+            "priority_regeneration_is_identity": mapping_is_identity,
             "preemption_active": _flag(block.get("PreemptionActive")),
             "hold_request": block.get("HoldRequest"),
             "status_verify": block.get("StatusVerify"),
             "loc_preempt_enabled": _flag(block.get("LocPreemptEnabled")),
             "loc_preempt_active": _flag(block.get("LocPreemptActive")),
         },
-        "source": "show tsn frame-preemption status + show running-config",
-        "mapping_note":
-            "The CLI expresses preemption per egress queue; "
-            "ieee802-dot1q-preemption expresses it per priority. Queue N is "
-            "reported as priorityN, which holds under the default 1:1 "
-            "priority-to-traffic-class map. Verify the map before relying on "
-            "this if priority regeneration has been changed.",
+        "source": "show tsn frame-preemption status + show running-config"
+                  + (" + show qos interface" if priority_regeneration else ""),
+        "mapping_note": note,
     }
 
 
-_QOS_SHAPER_RE = re.compile(
-    r"^qos queue-shaper queue\s+(\d+):\s*(\w+),\s*rate\s+(\d+)\s*(\w+),"
+_QOS_QUEUE_SHAPER_RE = re.compile(
+    r"^qos queue-shaper queue\s+(\d+):\s*(\w+),\s*rate:?\s+(\d+)\s*(\w+),"
     r"\s*mode:\s*([\w-]+),\s*excess:\s*(\w+),\s*credit:\s*(\w+)", re.I)
+_QOS_PORT_SHAPER_RE = re.compile(
+    r"^qos port shaper:\s*(\w+),\s*rate:?\s+(\d+)\s*(\w+),"
+    r"\s*mode:\s*([\w-]+)", re.I)
+_QOS_QUEUE_POLICER_RE = re.compile(
+    r"^qos queue-policer queue\s+(\d+)\s+mode:\s*(\w+),\s*rate:?\s+"
+    r"(\d+)\s*(\w+)", re.I)
+_QOS_POLICER_RE = re.compile(
+    r"^qos policer mode:\s*(\w+),\s*rate:?\s+(\d+)\s*(\w+)", re.I)
+_QOS_TAG_COS_RE = re.compile(
+    r"^qos map tag-cos pcp\s+(\d+)\s+dei\s+(\d+)\s+cos\s+(\d+)"
+    r"\s+dpl\s+(\d+)", re.I)
+_QOS_COS_TAG_RE = re.compile(
+    r"^qos map cos-tag cos\s+(\d+)\s+dpl\s+(\d+)\s+pcp\s+(\d+)"
+    r"\s+dei\s+(\d+)", re.I)
+_QOS_CUT_THROUGH_RE = re.compile(
+    r"^qos cut-through queue\s+(\d+):\s*(\w+)", re.I)
+_QOS_SCALAR_RE = re.compile(
+    r"^qos (cos|pcp|dpl|dei)\s+(\d+)$", re.I)
+_QOS_TRUST_RE = re.compile(r"^qos trust (tag|dscp)\s+(\w+)", re.I)
+_QOS_SIMPLE_RE = re.compile(
+    r"^qos (dscp-translate|dscp-classify|dscp-remark|tag-remark|wrr mode:|"
+    r"qce addr|qce key)\s*:?\s*(.+)$", re.I)
+
+_RATE_TO_KBPS = {"kbps": 1, "mbps": 1000, "gbps": 1000000}
+
+
+def _rate_kbps(value: Optional[int], unit: Optional[str]) -> Optional[int]:
+    if value is None or not unit:
+        return None
+    factor = _RATE_TO_KBPS.get(unit.lower())
+    return value * factor if factor else None
 
 
 def _parse_qos(text: Optional[str]) -> dict:
+    """`show qos interface <if>` in full.
+
+    The command prints the port's whole QoS configuration: the ingress
+    classification path, the egress remarking path, policers, shapers,
+    scheduling and cut-through. An earlier version read only the queue
+    shapers, which meant the record could not answer the one question a CNC
+    has to ask -- which traffic class does a tagged frame land in -- and
+    silently hid that ingress tags are not trusted on any port here.
+
+    Where 802.1Q defines a node the value goes under that name; the rest
+    keeps its ISTAX name under `vendor`, because inventing a standard-looking
+    home for a vendor knob is worse than admitting it is one.
+    """
     out: dict = {"nodes_present": [], "values": {}}
-    shapers = {}
-    for line in _clean_lines(text):
-        m = _QOS_SHAPER_RE.match(line.strip())
+    classification: dict = {}
+    remark: dict = {}
+    pcp_to_cos: Dict[str, dict] = {}
+    cos_to_pcp: Dict[str, dict] = {}
+    queue_shapers: Dict[str, dict] = {}
+    queue_policers: Dict[str, dict] = {}
+    cut_through: Dict[str, bool] = {}
+    vendor: dict = {}
+
+    for raw in _clean_lines(text):
+        line = raw.strip()
+        if not line.lower().startswith("qos "):
+            continue
+
+        m = _QOS_SCALAR_RE.match(line)
         if m:
-            shapers[f"queue{m.group(1)}"] = {
+            classification[f"default_{m.group(1).lower()}"] = to_int(m.group(2))
+            continue
+
+        m = _QOS_TRUST_RE.match(line)
+        if m:
+            classification[f"trust_{m.group(1).lower()}"] = \
+                m.group(2).lower() == "enabled"
+            continue
+
+        m = _QOS_TAG_COS_RE.match(line)
+        if m:
+            pcp, dei, cos, dpl = (to_int(g) for g in m.groups())
+            pcp_to_cos[f"pcp{pcp}-dei{dei}"] = {
+                "pcp": pcp, "dei": dei,
+                "traffic_class": cos, "drop_precedence": dpl}
+            continue
+
+        m = _QOS_COS_TAG_RE.match(line)
+        if m:
+            cos, dpl, pcp, dei = (to_int(g) for g in m.groups())
+            cos_to_pcp[f"cos{cos}-dpl{dpl}"] = {
+                "traffic_class": cos, "drop_precedence": dpl,
+                "pcp": pcp, "dei": dei}
+            continue
+
+        m = _QOS_QUEUE_SHAPER_RE.match(line)
+        if m:
+            queue_shapers[f"queue{m.group(1)}"] = {
                 "enabled": m.group(2).lower() == "enabled",
                 "rate": to_int(m.group(3)),
                 "rate_unit": m.group(4),
+                "rate_kbps": _rate_kbps(to_int(m.group(3)), m.group(4)),
                 "mode": m.group(5),
                 "excess": m.group(6).lower() == "enabled",
                 "credit": m.group(7).lower() == "enabled",
             }
-    if shapers:
+            continue
+
+        m = _QOS_PORT_SHAPER_RE.match(line)
+        if m:
+            out["values"]["port-shaper"] = {
+                "enabled": m.group(1).lower() == "enabled",
+                "rate": to_int(m.group(2)),
+                "rate_unit": m.group(3),
+                "rate_kbps": _rate_kbps(to_int(m.group(2)), m.group(3)),
+                "mode": m.group(4),
+            }
+            out["nodes_present"].append("port-shaper")
+            continue
+
+        m = _QOS_QUEUE_POLICER_RE.match(line)
+        if m:
+            queue_policers[f"queue{m.group(1)}"] = {
+                "enabled": m.group(2).lower() != "disabled",
+                "mode": m.group(2),
+                "rate": to_int(m.group(3)),
+                "rate_unit": m.group(4),
+                "rate_kbps": _rate_kbps(to_int(m.group(3)), m.group(4)),
+            }
+            continue
+
+        m = _QOS_POLICER_RE.match(line)
+        if m:
+            out["values"]["port-policer"] = {
+                "enabled": m.group(1).lower() != "disabled",
+                "mode": m.group(1),
+                "rate": to_int(m.group(2)),
+                "rate_unit": m.group(3),
+                "rate_kbps": _rate_kbps(to_int(m.group(2)), m.group(3)),
+            }
+            out["nodes_present"].append("port-policer")
+            continue
+
+        m = _QOS_CUT_THROUGH_RE.match(line)
+        if m:
+            cut_through[f"queue{m.group(1)}"] = \
+                m.group(2).lower() == "enabled"
+            continue
+
+        m = _QOS_SIMPLE_RE.match(line)
+        if m:
+            key = m.group(1).strip().rstrip(":").replace(" ", "-").lower()
+            value = m.group(2).strip()
+            if key == "tag-remark":
+                remark["mode"] = value
+            else:
+                vendor[key] = value
+            continue
+
+        vendor.setdefault("unparsed", []).append(line)
+
+    if classification:
+        # 802.1Q calls this the priority regeneration / PCP decoding table.
+        # ISTAX calls the result "cos"; it is the traffic class.
+        out["values"]["ingress-classification"] = classification
+        out["nodes_present"].append("ingress-classification")
+    if pcp_to_cos:
+        out["values"]["pcp-decoding-map"] = pcp_to_cos
+        out["nodes_present"].append("pcp-decoding-map")
+        out["values"]["priority_regeneration"] = {
+            str(e["pcp"]): e["traffic_class"]
+            for e in pcp_to_cos.values() if e["dei"] == 0}
+        identity = all(int(k) == v for k, v in
+                       out["values"]["priority_regeneration"].items())
+        out["values"]["priority_regeneration_is_identity"] = identity
+    if cos_to_pcp:
+        out["values"]["pcp-encoding-map"] = cos_to_pcp
+        out["nodes_present"].append("pcp-encoding-map")
+    if remark:
+        out["values"]["egress-tag-remark"] = remark
+        out["nodes_present"].append("egress-tag-remark")
+    if queue_shapers:
         out["nodes_present"].append("queue-shaper")
-        out["values"]["queue-shaper"] = shapers
+        out["values"]["queue-shaper"] = queue_shapers
         # A credit-enabled shaper is 802.1Qav (CBS) in all but name.
-        if any(s["credit"] and s["enabled"] for s in shapers.values()):
+        if any(s["credit"] and s["enabled"] for s in queue_shapers.values()):
             out["credit_based_shaper_active"] = True
+    if queue_policers:
+        out["nodes_present"].append("queue-policer")
+        out["values"]["queue-policer"] = queue_policers
+    if cut_through:
+        out["nodes_present"].append("cut-through")
+        out["values"]["cut-through"] = cut_through
+    if vendor:
+        out["values"]["vendor"] = vendor
     return out
 
 

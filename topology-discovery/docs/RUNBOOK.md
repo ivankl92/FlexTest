@@ -308,6 +308,10 @@ read -rs ISTAX_PASSWORD; export ISTAX_PASSWORD
 not the NETCONF ones — `netconf`/`geheim` is a NETCONF account and will not
 log in to the CLI.
 
+If your switches have no password set, skip this: the collector tries the
+`admin` account with an empty password and says so in a note. That note is
+not a warning that the run will fail.
+
 ### 6.2 Choosing a transport explicitly
 
 ```bash
@@ -352,10 +356,26 @@ mean path delay, steps removed, servo state and a **lock verdict**:
 
 | Verdict | Meaning |
 |---|---|
+| `grandmaster` | this switch **is** the reference. Its zero offset is definitional, not measured — see below |
 | `locked` | offset within tolerance (default 1 µs) — `safe_to_schedule: true` |
 | `out-of-tolerance` | PTP running but the offset is too large |
+| `inconsistent` | the offset looks fine but the synchronising port reports `as-capable false`. Two readings that cannot both be right |
 | `not-synchronised` | every PTP port disabled, initializing or faulty |
 | `unknown` | PTP could not be read at all |
+
+**`grandmaster` is not a stronger `locked`, it is a different claim.** A
+grandmaster reports offset 0 and a free-running servo because nothing is
+disciplining it. Whether its time is any good depends on where *it* gets
+time from, which nothing inside the network can check. The verdict carries
+`clock_class` and `time_source` so you can see: this testbed's grandmaster
+(SW1) advertises clock class 248 and time source 0xA0, internal oscillator.
+Everything here is disciplined to SW1's crystal. That is fine for measuring
+latency *between ports of this network* and meaningless as absolute time.
+
+`capabilities.md` §3 also states whether all switches name the same
+grandmaster. If they do not, each one can report `locked` while the network
+has no common time base at all — the failure a per-switch offset reading
+cannot see.
 
 It is advisory and based on one sample. Before trusting a Qbv schedule, keep
 checking gPTP around each measurement point the way `i226-adaptation`
@@ -378,9 +398,17 @@ tree, so its projection carries only the augmentation leaves and expects
 
 Each projection lists `unavailable` (nodes the model defines that the CLI
 does not print) and `derived` (values filled by inference, with the
-inference stated). Notably `as-capable` is **absent, not guessed** — the
-CLI never prints it, and a fabricated value would be a time base nobody
-verified. REPORT §4.1 explains the choice.
+inference stated).
+
+`as-capable` **is** read, per port, from the `802.1AS port status` table
+that `show ptp 0 port-state` prints after the port-state table. So is
+`is-measuring-delay`, the neighbour rate ratio, the port role and the
+802.1AS version. An earlier version of this tool declared `as-capable`
+unobtainable and never parsed that table; REPORT §4.2 is the correction.
+What genuinely cannot be filled is `mean-link-delay` — the `cur-MPR`
+column is a bare integer with no unit that reads 0 on every port here, so
+the raw value is kept as `mean-link-delay-raw` rather than rescaled on a
+guess.
 
 ### 6.5 Confirming the NETCONF regression on a switch
 
@@ -438,7 +466,7 @@ specific run only if it is worth keeping as a reference.
 
 ## 8. Reading the output
 
-### 7.1 Start with the console summary
+### 8.1 Start with the console summary
 
 ```
 Switches contacted : 5/5
@@ -454,7 +482,7 @@ CNC gaps recorded  : 5
 REPORT.md §4. It is a property of the switch firmware, not a fault in the
 run.
 
-### 7.2 `topology.md`
+### 8.2 `topology.md`
 
 §3 is the link table. The columns that matter:
 
@@ -472,23 +500,27 @@ discovery did not see is a fault. An endpoint not observed usually is not —
 an end station that neither runs LLDP nor has transmitted recently has no
 FDB entry and is invisible to both methods (§9.7).
 
-### 7.3 `capabilities.md`
+### 8.3 `capabilities.md`
 
 - §2 is the feature matrix. `**no**` for QCI, QAV, QCC and PTP is expected;
   `**no**` for QBV or QBU on a switch where the others have it means that
   switch is on different firmware — check §1 of the same file for its module
   count.
-- §3 is the Qbv envelope: the largest gate-control list, cycle time and
-  interval that will work **everywhere** in this network. On this hardware
-  expect 128 entries, ≈33.5 ms, ≈33.5 ms.
-- §4 is per-port state.
+- §3 is PTP: the lock verdict per switch, whether all switches agree on one
+  grandmaster, and the three YANG projections (§6.4).
+- §4 is the Qbv envelope: the largest gate-control list, cycle time and
+  interval that will work **everywhere** in this network. Over the CLI the
+  cycle and interval maxima read `-`, because `show tsn tas status` prints
+  only `SupportedListMax`; they are reported as unknown, never guessed.
+- §5 is ingress classification — read it before you plan a schedule.
+- §6 is per-port state.
 - **Warnings** affect a port whose gate is enabled — act on these.
   **Notes** are inert, typically the factory default `admin-cycle-time` of
   100 ms exceeding the supported maximum of ≈33.5 ms on ports whose gate is
   off. That is cosmetic until you enable a gate on such a port without
   setting a cycle time.
 
-### 7.4 `cnc-input.json`
+### 8.4 `cnc-input.json`
 
 The interchange document, `schema: tsn-testbed/cnc-input/v1`. The three
 fields to look at first:
@@ -505,6 +537,51 @@ jq '.gaps[] | {capability, impact}' topology/cnc-input.json
 # every port that carries an inter-switch link
 jq '.network.bridges[].ports[] | select(.role=="inter-switch")
     | {name, speed_mbps, neighbour: .neighbour.node}' topology/cnc-input.json
+```
+
+---
+
+### 8.5 Ingress classification, and why it comes before scheduling
+
+`capabilities.md` §5 answers a question Qbv cannot answer for itself:
+**can a talker reach the class you intend to gate?**
+
+A gate-control list opens and closes *traffic classes*. Which class a frame
+lands in is decided earlier, on ingress, by two things this section reports
+per port:
+
+- **Does the port trust the incoming VLAN tag?** If `qos trust tag` is
+  disabled, the PCP the talker set is ignored and every frame is classified
+  to the port's default class. Gate classes 1–7 on such a port and you are
+  gating empty queues while all your traffic sits in class 0 with its gate
+  wide open. On this testbed as of 2026-09-18 this is true of **all 40
+  ports**.
+- **Is the PCP-to-class map the identity?** On this hardware it is not:
+  PCP 0 maps to class 1 and PCP 1 to class 0, which is what 802.1Q
+  recommends as the default. So "priority 6 means gate index 6" happens to
+  hold, but "priority 0 means gate index 0" does not.
+
+Fix the first on the ports carrying scheduled traffic:
+
+```
+configure terminal
+interface GigabitEthernet 1/1
+ qos trust tag
+end
+```
+
+Then re-run discovery and check that §5 shows the port as trusting. Both
+facts also appear in `cnc-input.json` under the `ingress-classification`
+and `priority-regeneration` gaps, the first with
+`impact: blocking-for-scheduling`.
+
+The per-port map is in `capabilities.json`:
+
+```bash
+jq '.switches[].interfaces[]
+    | select(.qos.values.priority_regeneration != null)
+    | {port: .name, trust: .qos.values["ingress-classification"].trust_tag,
+       map: .qos.values.priority_regeneration}' topology/capabilities.json
 ```
 
 ---
@@ -780,7 +857,7 @@ built that way is confidently wrong — REPORT.md §5.3.
 The full pipeline can be exercised offline, which is how it was developed:
 
 ```bash
-# 100 tests: parsers for both transports, live session path, topology,
+# 134 tests: parsers for both transports, live session path, topology,
 # CNC document, and the NETCONF-vs-CLI record uniformity check
 python3 -m unittest discover -s tests -v
 
@@ -794,7 +871,15 @@ python3 tests/make_cli_fixture.py --out results/cli-fixture \
         --from-transcript /path/to/your/session.txt
 python3 -m tsn_discovery.cli --reanalyse results/cli-fixture \
         --inventory ../SYSTEM.md --no-publish
+
+# best of all: re-analyse a real run. No network access, no switch touched.
+python3 -m tsn_discovery.cli --reanalyse results/20260918-144416
 ```
+
+`--reanalyse` over a real run directory is the fastest way to check a parser
+change: it re-reads the captures under `raw/` and rebuilds every document,
+so a fix can be verified against five switches' actual output in under a
+second. Every defect listed in REPORT §9.1 was fixed and confirmed this way.
 
 `make_cli_fixture.py` is the more useful of the two day to day: paste a
 session of `show` commands from any switch into a file and it becomes a

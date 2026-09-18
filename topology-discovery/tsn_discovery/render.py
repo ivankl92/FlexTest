@@ -145,12 +145,21 @@ def topology_markdown(topo: dict, run_meta: dict, inventory_path: str) -> str:
         A(f"- **Switches in SYSTEM.md that discovery did not see:** "
           f"{', '.join(cc['switches_in_inventory_not_discovered'])}")
     if cc["endpoints_in_inventory_not_observed"]:
-        A(f"- Endpoints in SYSTEM.md not observed: "
-          f"{', '.join(cc['endpoints_in_inventory_not_observed'])}")
+        missing = cc["endpoints_in_inventory_not_observed"]
+        A(f"- Endpoints in SYSTEM.md not observed: {', '.join(missing)}")
         A("  (not necessarily a fault: an end station that neither runs LLDP "
           "nor has transmitted recently has no filtering-database entry and "
           "is invisible to both discovery methods. Generate traffic from it, "
           "or shorten the FDB aging time, and re-run.)")
+        silent = topo.get("silent_link_up_ports") or []
+        if silent:
+            where = ", ".join(f"`{p['switch']}:{p['port']}`" for p in silent)
+            A(f"  There are {len(silent)} port(s) with a link and nothing "
+              f"identified on them — {where}. "
+              + ("That is the same count as the unobserved endpoints above, "
+                 "so those devices are most likely cabled there and simply "
+                 "silent. " if len(silent) == len(missing) else "")
+              + "Ping from one and re-run to confirm which is which.")
     if cc["discovered_but_not_in_inventory"]:
         A(f"- **Discovered but not in SYSTEM.md:** "
           f"{', '.join(cc['discovered_but_not_in_inventory'])}")
@@ -288,28 +297,58 @@ def capabilities_markdown(records: Dict[str, dict], cnc_doc: dict,
     ptp_rows = [(n, r) for n, r in sorted(records.items())
                 if (r.get("ptp") or {}).get("status") == "available-via-cli"]
     if ptp_rows:
-        A("| Switch | Profile | Offset from master | Mean path delay | "
-          "Steps removed | Servo | Lock verdict |")
+        A("| Switch | Profile | Offset from master | Steps removed | "
+          "Servo | as-capable ports | Lock verdict |")
         A("|---|---|---|---|---|---|---|")
+        grandmasters = []
         for name, rec in ptp_rows:
             ptp = rec["ptp"]
             s = ptp.get("sync_summary", {})
             lock = ptp.get("lock", {})
             offset = s.get("offset_from_master_ns")
-            delay = s.get("mean_path_delay_ns")
+            as_cap = s.get("as_capable") or {}
+            capable = sum(1 for v in as_cap.values() if v)
+            if s.get("is_grandmaster"):
+                grandmasters.append((name, lock))
             A(f'| {name} '
               f'| {"gPTP (802.1AS)" if ptp.get("gptp_profile") else "—"} '
               f'| {f"{offset:+.3f} ns" if offset is not None else "-"} '
-              f'| {f"{delay:.3f} ns" if delay is not None else "-"} '
               f'| {s.get("steps_removed") if s.get("steps_removed") is not None else "-"} '
               f'| {s.get("servo_state") or "-"} '
+              f'| {f"{capable}/{len(as_cap)}" if as_cap else "-"} '
               f'| **{lock.get("verdict", "unknown")}** |')
         A("")
-        A("A lock verdict is advisory and based on a single sample, and "
-          "`as-capable` — the gPTP predicate that would settle it — is not "
-          "printed by the CLI. A measurement campaign should re-check before "
-          "and after every point, as `i226-adaptation` does with `pmc` on the "
-          "end stations.")
+
+        gm_ids = {(r.get("ptp") or {}).get("sync_summary", {})
+                  .get("grandmaster_identity") for _, r in ptp_rows}
+        gm_ids.discard(None)
+        if len(gm_ids) == 1:
+            A(f"All {len(ptp_rows)} switches name the same grandmaster "
+              f"(`{next(iter(gm_ids))}`), so they are one time domain, and "
+              "steps removed gives each switch's depth below it.")
+            A("")
+        elif len(gm_ids) > 1:
+            A(f"**These switches do not share a grandmaster** — "
+              f"{len(gm_ids)} distinct identities are named: "
+              + ", ".join(f"`{g}`" for g in sorted(gm_ids)) +
+              ". Each domain can look healthy on its own while the network "
+              "has no common time base, which is exactly the condition a "
+              "per-switch offset reading cannot detect.")
+            A("")
+
+        for name, lock in grandmasters:
+            A(f"**{name} is the grandmaster**, so its zero offset and "
+              "free-running servo are definitional rather than measured, and "
+              "it gets its own verdict rather than `locked`. "
+              + (lock.get("caveat") or ""))
+            A("")
+
+        A("Every verdict is advisory and rests on a single sample. A "
+          "measurement campaign should re-check before and after each point, "
+          "as `i226-adaptation` does with `pmc` on the end stations. "
+          "`as-capable` is read per port from the `802.1AS port status` "
+          "table of `show ptp 0 port-state`; a switch whose synchronising "
+          "port reports it false is reported `inconsistent`, not `locked`.")
         A("")
         models = (ptp_rows[0][1]["ptp"].get("models") or {})
         if models:
@@ -355,7 +394,64 @@ def capabilities_markdown(records: Dict[str, dict], cnc_doc: dict,
       "port. A schedule that fits inside them is installable network-wide.")
     A("")
 
-    A("## 5. Per-port state")
+    # --- ingress classification ------------------------------------------
+    # A gate-control list gates traffic classes. Whether a talker can reach
+    # a given class is decided here, before Qbv ever sees the frame, so this
+    # belongs next to the Qbv envelope and not buried in a per-port table.
+    trust_rows = []
+    for name, rec in sorted(records.items()):
+        ports = [i for i in rec.get("interfaces", []) if i.get("is_bridge_port")]
+        trusted, regen_identity, seen = 0, 0, 0
+        for iface in ports:
+            values = (iface.get("qos") or {}).get("values") or {}
+            classification = values.get("ingress-classification") or {}
+            if "trust_tag" not in classification:
+                continue
+            seen += 1
+            if classification.get("trust_tag"):
+                trusted += 1
+            if values.get("priority_regeneration_is_identity"):
+                regen_identity += 1
+        if seen:
+            trust_rows.append((name, trusted, regen_identity, seen))
+
+    if trust_rows:
+        A("## 5. Ingress classification — can a talker reach a gated class?")
+        A("")
+        A("| Switch | Ports trusting the VLAN tag | Ports with an identity "
+          "PCP map |")
+        A("|---|---|---|")
+        for name, trusted, identity, seen in trust_rows:
+            A(f"| {name} | {trusted}/{seen} | {identity}/{seen} |")
+        A("")
+        total_seen = sum(r[3] for r in trust_rows)
+        total_trusted = sum(r[1] for r in trust_rows)
+        total_identity = sum(r[2] for r in trust_rows)
+        if total_trusted == 0:
+            A("> **No port trusts the incoming VLAN tag.** Every frame is "
+              "classified to the port's default traffic class whatever PCP "
+              "the talker sets, so a gate-control list that opens classes "
+              "1–7 opens them onto empty queues. This is configuration, not "
+              "a missing capability — the hardware supports it — but it has "
+              "to be changed before any schedule means anything. See the "
+              "`ingress-classification` entry in §7.")
+            A("")
+        elif total_trusted < total_seen:
+            A(f"> {total_seen - total_trusted} of {total_seen} bridge ports "
+              "ignore the incoming VLAN tag and classify to the port "
+              "default. Check that the ports carrying scheduled traffic are "
+              "not among them.")
+            A("")
+        if total_identity < total_seen:
+            A(f"> {total_seen - total_identity} of {total_seen} ports "
+              "regenerate priority by something other than the identity map, "
+              "so a stream's PCP is not its gate index. The per-port map is "
+              "in `capabilities.json` under "
+              "`interfaces[].qos.values.priority_regeneration`, and the Qbu "
+              "per-priority record already applies it.")
+            A("")
+
+    A("## 6. Per-port state")
     A("")
     for name, rec in sorted(records.items()):
         if not rec.get("reachable"):
@@ -415,7 +511,7 @@ def capabilities_markdown(records: Dict[str, dict], cnc_doc: dict,
                 A(f"- {n}")
             A("")
 
-    A("## 6. Gaps for a Centralized Network Configuration entity")
+    A("## 7. Gaps for a Centralized Network Configuration entity")
     A("")
     for gap in cnc_doc["gaps"]:
         A(f"### `{gap['capability']}` — {gap['impact']}")

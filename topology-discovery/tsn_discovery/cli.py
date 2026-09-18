@@ -388,9 +388,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("       run scripts/setup_env.sh.", file=sys.stderr)
             return 2
         if args.transport != "netconf" and not args.cli_password:
-            print("warning: no CLI password set. Export ISTAX_PASSWORD (or pass "
-                  "--cli-password) or the fallback cannot log in.",
-                  file=sys.stderr)
+            # An empty password is a legitimate configuration -- these
+            # switches accept the `admin` account with no password unless one
+            # has been set. Saying the fallback "cannot log in" and then
+            # logging in teaches the reader to ignore the warnings.
+            print("note: no CLI password set; the fallback will try the "
+                  f"'{args.cli_user}' account with an empty password. Export "
+                  "ISTAX_PASSWORD or pass --cli-password if your switches "
+                  "have one.", file=sys.stderr)
 
         run_dir = os.path.abspath(os.path.join(args.out, run_id))
         raw_root = os.path.join(run_dir, "raw")

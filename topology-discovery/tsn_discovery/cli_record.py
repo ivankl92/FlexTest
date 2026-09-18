@@ -21,7 +21,27 @@ from typing import Dict, List, Optional
 from . import istax_parse as P
 from . import ptp as ptp_mod
 from .istax import CliResult
+from .istax_parse import norm_mac
 from .probe import FEATURE_MODULES
+
+
+def _eui64(mac: Optional[str]) -> Optional[str]:
+    """A 48-bit MAC in the EUI-64 form IEEE 1588 uses for clockIdentity:
+    the OUI, then ``ff:fe``, then the rest."""
+    if not mac:
+        return None
+    parts = mac.split(":")
+    if len(parts) != 6:
+        return None
+    return ":".join(parts[:3] + ["ff", "fe"] + parts[3:])
+
+
+def _clock_identity(ptp_record: dict) -> Optional[str]:
+    try:
+        inst = ptp_record["models"]["ietf-ptp"]["instance-list"][0]
+        return inst["default-ds"].get("clock-identity")
+    except (KeyError, IndexError, TypeError):
+        return None
 
 
 # Which command answering proves which feature exists on this firmware.
@@ -135,6 +155,12 @@ def build(result: CliResult, netconf_probe: Optional[dict] = None) -> dict:
             iface["qbv"] = P._tas_status_to_qbv({}, [])
             iface["qbv"]["configured"] = False
 
+        # QoS is parsed before Qbu, because the priority regeneration map it
+        # carries is what turns "queue N" into "priority N" correctly.
+        qos_text = result.text_of(f"qos--{slug}") or result.text_of("qos")
+        parsed_qos = P._parse_qos(qos_text)
+        prio_regen = parsed_qos["values"].get("priority_regeneration")
+
         fp = fp_blocks.get(iface["name"])
         if fp is None:
             per_port = P.parse_kv_blocks(
@@ -143,10 +169,8 @@ def build(result: CliResult, netconf_probe: Optional[dict] = None) -> dict:
                 list(per_port.values())[0] if per_port else None)
         queues = iface.get("_preemptable_queues", [])
         if fp or queues:
-            iface["qbu"] = P._fp_status_to_qbu(fp or {}, queues)
+            iface["qbu"] = P._fp_status_to_qbu(fp or {}, queues, prio_regen)
 
-        qos_text = result.text_of(f"qos--{slug}") or result.text_of("qos")
-        parsed_qos = P._parse_qos(qos_text)
         if parsed_qos["nodes_present"]:
             merged = iface["qos"]
             merged["nodes_present"] = sorted(
@@ -163,21 +187,54 @@ def build(result: CliResult, netconf_probe: Optional[dict] = None) -> dict:
     vlans = P.parse_vlans(result.text_of("vlan"))
     fdb = P.parse_mac_table(result.text_of("mac-address-table"), port_number_of)
 
-    bridge_address = running_cfg.get("bridge_address")
-    if not bridge_address:
-        # Fallback: the switch's own address appears as a static CPU entry
-        # in the filtering database.
-        for entry in fdb:
-            if entry.get("cpu") and entry["entry_type"] == "static":
-                addr = entry["address"]
-                if addr and not addr.startswith(("01:", "33:33", "ff:ff")):
-                    bridge_address = addr
-                    break
+    # The switch's own address is the unicast static CPU entry in the
+    # filtering database. That is a reading, not an inference: the firmware
+    # installs it so frames addressed to the bridge reach the CPU. It also
+    # agrees with the PTP clock identity, which is this MAC in EUI-64 form,
+    # and with the Chassis ID its neighbours report over LLDP -- three
+    # independent sources, cross-checked below.
+    bridge_address = None
+    bridge_address_source = None
+    for entry in fdb:
+        if entry.get("cpu") and entry["entry_type"] == "static":
+            addr = entry["address"]
+            if addr and not addr.startswith(("01:", "33:33", "ff:ff")):
+                bridge_address = addr
+                bridge_address_source = "static CPU entry in show mac address-table"
+                break
+
+    bridge_warnings: List[str] = []
+    mst_region = running_cfg.get("mst_region_name")
+    mst_mac = norm_mac(mst_region) if mst_region else None
+    if bridge_address and mst_mac and mst_mac != bridge_address:
+        bridge_warnings.append(
+            f"the MST region name (`{mst_region}`) looks like a MAC address "
+            f"but is not this bridge's ({bridge_address}). It is a region "
+            "name, so this is legal -- but switches only form one MST region "
+            "when their region names match, so check that this is deliberate.")
+    if bridge_address is None:
+        bridge_warnings.append(
+            "no unicast static CPU entry in `show mac address-table`, so the "
+            "bridge address is unknown. It is left empty rather than "
+            "substituted from the MST region name, which is not an address.")
+
+    ptp_clock_id = _clock_identity(ptp_record)
+    if bridge_address and ptp_clock_id:
+        expected = _eui64(bridge_address)
+        if expected and expected != ptp_clock_id:
+            bridge_warnings.append(
+                f"the PTP clock identity ({ptp_clock_id}) is not the EUI-64 "
+                f"form of the bridge address ({bridge_address}). One of the "
+                "two readings is off; check the raw captures before trusting "
+                "either.")
 
     bridges = [{
         "name": "bridge0",
         "address": bridge_address,
         "address_raw": bridge_address,
+        "address_source": bridge_address_source,
+        "mst_region_name": mst_region,
+        "warnings": bridge_warnings,
         "bridge_type": None,
         "ports": len(interfaces),
         "up_time_s": None,

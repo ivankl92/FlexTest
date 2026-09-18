@@ -97,44 +97,131 @@ interface GigabitEthernet 1/5
 """
 
 QOS = """\
-qos queue-shaper queue 0: disabled, rate 500 kbps, mode: line-rate, excess: disabled, credit: disabled
-qos queue-shaper queue 1: disabled, rate 500 kbps, mode: line-rate, excess: disabled, credit: disabled
-qos queue-shaper queue 2: disabled, rate 500 kbps, mode: line-rate, excess: disabled, credit: disabled
-qos queue-shaper queue 3: disabled, rate 500 kbps, mode: line-rate, excess: disabled, credit: disabled
-qos queue-shaper queue 4: disabled, rate 500 kbps, mode: line-rate, excess: disabled, credit: disabled
-qos queue-shaper queue 5: disabled, rate 500 kbps, mode: line-rate, excess: disabled, credit: disabled
-qos queue-shaper queue 6: enabled, rate 800 kbps, mode: line-rate, excess: disabled, credit: enabled
-qos queue-shaper queue 7: disabled, rate 500 kbps, mode: line-rate, excess: disabled, credit: disabled
+interface GigabitEthernet 1/5
+ qos cos 0
+ qos pcp 0
+ qos dpl 0
+ qos dei 0
+ qos trust tag disabled
+ qos map tag-cos pcp 0 dei 0 cos 1 dpl 0
+ qos map tag-cos pcp 0 dei 1 cos 1 dpl 1
+ qos map tag-cos pcp 1 dei 0 cos 0 dpl 0
+ qos map tag-cos pcp 1 dei 1 cos 0 dpl 1
+ qos map tag-cos pcp 2 dei 0 cos 2 dpl 0
+ qos map tag-cos pcp 2 dei 1 cos 2 dpl 1
+ qos map tag-cos pcp 3 dei 0 cos 3 dpl 0
+ qos map tag-cos pcp 3 dei 1 cos 3 dpl 1
+ qos map tag-cos pcp 4 dei 0 cos 4 dpl 0
+ qos map tag-cos pcp 4 dei 1 cos 4 dpl 1
+ qos map tag-cos pcp 5 dei 0 cos 5 dpl 0
+ qos map tag-cos pcp 5 dei 1 cos 5 dpl 1
+ qos map tag-cos pcp 6 dei 0 cos 6 dpl 0
+ qos map tag-cos pcp 6 dei 1 cos 6 dpl 1
+ qos map tag-cos pcp 7 dei 0 cos 7 dpl 0
+ qos map tag-cos pcp 7 dei 1 cos 7 dpl 1
+                                                    qos trust dscp disabled
+ qos policer mode: disabled, rate: 500 kbps
+ qos queue-policer queue 0 mode: disabled, rate: 500 kbps
+ qos queue-policer queue 1 mode: disabled, rate: 500 kbps
+ qos queue-policer queue 2 mode: disabled, rate: 500 kbps
+ qos queue-policer queue 3 mode: disabled, rate: 500 kbps
+ qos queue-policer queue 4 mode: disabled, rate: 500 kbps
+ qos queue-policer queue 5 mode: disabled, rate: 500 kbps
+ qos queue-policer queue 6 mode: disabled, rate: 500 kbps
+ qos queue-policer queue 7 mode: disabled, rate: 500 kbps
+ qos port shaper: disabled, rate: 500 kbps, mode: line-rate
+ qos queue-shaper queue 0: disabled, rate: 500 kbps, mode: line-rate, excess: disabled, credit: disabled
+ qos queue-shaper queue 1: disabled, rate: 500 kbps, mode: line-rate, excess: disabled, credit: disabled
+ qos queue-shaper queue 2: disabled, rate: 500 kbps, mode: line-rate, excess: disabled, credit: disabled
+ qos queue-shaper queue 3: disabled, rate: 500 kbps, mode: line-rate, excess: disabled, credit: disabled
+ qos queue-shaper queue 4: disabled, rate: 500 kbps, mode: line-rate, excess: disabled, credit: disabled
+ qos queue-shaper queue 5: disabled, rate: 500 kbps, mode: line-rate, excess: disabled, credit: disabled
+ qos queue-shaper queue 6: disabled, rate: 500 kbps, mode: line-rate, excess: disabled, credit: disabled
+ qos queue-shaper queue 7: disabled, rate: 500 kbps, mode: line-rate, excess: disabled, credit: disabled
+ qos wrr mode: disabled
+ qos cut-through queue 0: disabled
+ qos cut-through queue 1: disabled
+ qos cut-through queue 2: disabled
+ qos cut-through queue 3: disabled
+ qos cut-through queue 4: disabled
+ qos cut-through queue 5: disabled
+ qos cut-through queue 6: disabled
+ qos cut-through queue 7: disabled
+ qos tag-remark classified
+ qos map cos-tag cos 0 dpl 0 pcp 1 dei 0
+ qos map cos-tag cos 0 dpl 1 pcp 1 dei 1
+ qos map cos-tag cos 1 dpl 0 pcp 0 dei 0
+ qos map cos-tag cos 1 dpl 1 pcp 0 dei 1
+ qos map cos-tag cos 2 dpl 0 pcp 2 dei 0
+ qos map cos-tag cos 2 dpl 1 pcp 2 dei 1
+ qos map cos-tag cos 3 dpl 0 pcp 3 dei 0
+ qos map cos-tag cos 3 dpl 1 pcp 3 dei 1
+ qos map cos-tag cos 4 dpl 0 pcp 4 dei 0
+ qos map cos-tag cos 4 dpl 1 pcp 4 dei 1
+ qos map cos-tag cos 5 dpl 0 pcp 5 dei 0
+ qos map cos-tag cos 5 dpl 1 pcp 5 dei 1
+ qos map cos-tag cos 6 dpl 0 pcp 6 dei 0
+ qos map cos-tag cos 6 dpl 1 pcp 6 dei 1
+ qos map cos-tag cos 7 dpl 0 pcp 7 dei 0
+ qos map cos-tag cos 7 dpl 1 pcp 7 dei 1
+ qos dscp-translate disabled
+ qos dscp-classify disabled
+ qos dscp-remark disabled
+ qos qce addr source
+ qos qce key normal
+"""
+
+
+# AN1185's worked example, kept because no port in this testbed enables a
+# credit-based shaper and the `credit: enabled` branch would otherwise be
+# untested. SYNTHETIC -- reference hardware, not this bench.
+QOS_WITH_CBS = """\
+ qos queue-shaper queue 5: disabled, rate: 500 kbps, mode: line-rate, excess: disabled, credit: disabled
+ qos queue-shaper queue 6: enabled, rate: 800 kbps, mode: line-rate, excess: disabled, credit: enabled
 """
 
 PTP_DEFAULT = """\
-ClockId  HW-Domain  DeviceType  Profile   2StepFlag  Ports  vtss_appl_clock_identity
--------  ---------  ----------  --------  ---------  -----  ------------------------
-0        0          Ord-Bound   802.1as   True       8      00:80:82:ff:fe:b9:65:33
+ClockId  HW-Domain  DeviceType  Profile     2StepFlag  Ports  vtss_appl_clock_identity
+-------  ---------  ----------  ----------  ---------  -----  ------------------------
+0        0          Ord-Bound   802.1as     True       8      00:80:82:ff:fe:bd:25:7c
 
-Dom  vtss_appl_clock_quality          Pri1  Pri2  Lpri
----  -------------------------------  ----  ----  ----
-0    Cl:248 Ac:Unknwn Va:00000        128   128   128
+Dom  vtss_appl_clock_quality         Pri1  Pri2  Lpri
+---  ------------------------------  ----  ----  ----
+0    Cl:248 Ac:Unknwn Va:17258       246   248   128
 
 Protocol         One-Way    VID    PCP  DSCP  PathTraceEnable
 ---------------  ---------  -----  ---  ----  ---------------
-Ethernet         False      1      6    0     False
+Ethernet         False      1      6    0     True
+
+gmCapable  sdoId
+---------  -----
+True       0x100
 """
 
 PTP_CURRENT = """\
 stpRm  OffsetFromMaster    MeanPathDelay
 -----  ------------------  ------------------
-1      -0.000,000,000,386  0.000,000,002,072
+1      -0.000,000,001,028   0.000,000,000,000
+lastGMPhaseChange                             lastGMFreqChange  gmTimeBaseIndicator
+--------------------------------------------  ----------------  -------------------
+                               0.000,000,000          0.999999                    0
+gmChangeCount  timeOfLastGMChangeEvent  timeOfLastGMPhaseChangeEvent  timeOfLastGMFreqChangeEvent
+-------------  -----------------------  ----------------------------  ---------------------------
+            2                     2283                          2296                         2296
 """
 
 PTP_PARENT = """\
-ParentPortIdentity       port  Pstat  Var  ChangeRate
------------------------  ----  -----  ---  ----------
-00:80:82:ff:fe:bd:25:7c  4     False  0    -142
+ParentPortIdentity      port  Pstat  Var  ChangeRate
+----------------------  ----  -----  ---  ----------
+00:80:82:ff:fe:b9:65:33 5     False  0    585
 
-GrandmasterIdentity      GrandmasterClockQuality      Pri1  Pri2
------------------------  ---------------------------  ----  ----
-00:80:82:ff:fe:bd:25:7c  Cl:248 Ac:Unknwn Va:00000    128   10
+GrandmasterIdentity      GrandmasterClockQuality    Pri1  Pri2
+-----------------------  -------------------------  ----  ----
+00:80:82:ff:fe:b9:65:33  Cl:248 Ac:Unknwn Va:17258  246   248
+
+cumulativeRateRatio
+-------------------
+                322
 """
 
 PTP_TIME_PROPERTY = """\
@@ -146,14 +233,35 @@ UtcOffset  Valid  leap59  leap61  TimeTrac  FreqTrac  ptpTimeScale  TimeSource
 PTP_PORT_STATE = """\
 Port  Enabled  PTP-State  Internal  Link  Port-Timer  Vlan-forw  Phy-timestamper  Peer-delay
 ----  -------  ---------  --------  ----  ----------  ---------  ---------------  ----------
-5     TRUE     slve       FALSE     Up    In Sync     Forward    FALSE            OK
-1     TRUE     mstr       FALSE     Up    In Sync     Forward    FALSE            OK
+   1  TRUE     dsbl       FALSE     Down  In Sync     Discard    TRUE             OK
+   2  TRUE     mstr       FALSE     Up    In Sync     Forward    TRUE             OK
+   3  TRUE     dsbl       FALSE     Down  In Sync     Discard    TRUE             OK
+   4  TRUE     slve       FALSE     Up    In Sync     Forward    TRUE             OK
+   5  TRUE     mstr       FALSE     Up    In Sync     Forward    FALSE            OK
+   6  TRUE     lstn       FALSE     Up    In Sync     Forward    FALSE            FAIL
+   7  FALSE    dsbl       FALSE     Down  In Sync     Discard    FALSE            OK
+   8  FALSE    dsbl       FALSE     Down  In Sync     Discard    FALSE            OK
+VirtualPort  Enabled  PTP-State  Io-pin
+-----------  -------  ---------  ------
+                                                             9  FALSE    dsbl        99999
+
+802.1AS port status:
+Port  port-role  is-mes-del  as-cap  rate-ratio   cur-anv  cur-syv  sync-time-intrv      cur-MPR  AMTE   comp-ratio  comp-delay  version  minor-ver
+----  ---------  ----------  ------  -----------  -------  -------  -------------------  -------  -----  ----------  ----------  -------  ---------
+   1  Disabled   False       False             0        0        0    0.000,000,000,000        0  False  False       False             2          1
+   2  Master     True        True       49558416        0       -3    0.000,000,000,000        0  False  True        True              2          1
+   3  Disabled   False       False             0        0        0    0.000,000,000,000        0  False  False       False             2          1
+   4  Slave      True        True            241        0       -3    0.375,000,000,000        0  False  True        True              2          1
+   5  Master     True        True            338        0       -3    0.000,000,000,000        0  False  True        True              2          1
+   6  Disabled   False       False             0        0       -3    0.000,000,000,000        0  False  True        True              2          1
+   7  Disabled   False       False             0        0        0    0.000,000,000,000        0  False  False       False             2          1
+   8  Disabled   False       False             0        0        0    0.000,000,000,000        0  False  False       False             2          1
 """
 
 PTP_SLAVE = """\
 Slave port  Slave state    Holdover(ppb)
 ----------  -------------  -------------
-5           PHASE_LOCKED   290.4
+4           PHASE_LOCKED   589.8
 """
 
 VENDOR_EXAMPLES: Dict[str, str] = {

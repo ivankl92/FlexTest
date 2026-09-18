@@ -32,7 +32,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:
     import paramiko
@@ -53,6 +53,19 @@ PROMPT_RE = re.compile(r"(?:^|[\r\n])([\w.\-]+(?:\([^)]*\))?[#>])\s*$")
 # exactly what a scraper wants. Space would page one screen at a time.
 MORE_RE = re.compile(r"--\s*more\s*--[^\r\n]*", re.IGNORECASE)
 MORE_CONTINUE = "g"
+
+# After the pager prompt is answered the firmware erases it with backspaces
+# followed by an equal run of spaces, and then continues writing output on
+# that same line. Removing the prompt text (MORE_RE) leaves the erase run
+# behind as leading whitespace, so a data row arrives looking like
+#
+#     "                                                   Dynamic 2  00:bb:..."
+#
+# which a column-sliced parser reads as a different row, or drops. No real
+# ISTAX output is indented anywhere near this far -- running-config uses one
+# space, right-aligned table columns at most a handful -- so a long run of
+# leading spaces is unambiguous pager residue.
+PAGER_RESIDUE_RE = re.compile(r"(?m)^[ \t]{15,}(?=\S)")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|[\x00\x07\x08]")
 
@@ -86,6 +99,9 @@ class CliCapture:
     error_kind: Optional[str] = None
     duration_s: float = 0.0
     optional: bool = False       # a failure here is informative, not a fault
+    pager_hits: int = 0          # `-- more --` prompts answered
+    pager_residue_removed: int = 0
+    notes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -384,8 +400,16 @@ class IstaxSession:
         m = PROMPT_RE.search(text or "")
         return m.group(1) if m else None
 
-    def _read_until_prompt(self, timeout: int) -> str:
+    def _read_until_prompt(self, timeout: int) -> Tuple[str, int]:
+        """Read until the shell prompt, answering the pager as it appears.
+
+        Returns the text and the number of pager prompts answered. The count
+        is kept because the erase run the pager leaves behind is removed
+        later by shape alone; comparing the two is what turns a silent
+        mis-parse into a recorded warning.
+        """
         buf = ""
+        pager_hits = 0
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.chan.recv_ready():
@@ -397,10 +421,11 @@ class IstaxSession:
                     # so it never reaches a parser.
                     self.chan.send(MORE_CONTINUE)
                     buf = MORE_RE.sub("", clean)
+                    pager_hits += 1
                     deadline = time.time() + timeout   # output is still coming
                     continue
                 if PROMPT_RE.search(clean):
-                    return clean
+                    return clean, pager_hits
             else:
                 time.sleep(0.05)
         raise TimeoutError(
@@ -443,8 +468,16 @@ class IstaxSession:
             while self.chan.recv_ready():          # drain anything stale
                 self.chan.recv(65535)
             self.chan.send(cmd + "\n")
-            raw = self._read_until_prompt(self.command_timeout)
-            cap.text = self._clean(raw, cmd)
+            raw, pager_hits = self._read_until_prompt(self.command_timeout)
+            cap.text, residue = self._clean(raw, cmd)
+            cap.pager_hits = pager_hits
+            cap.pager_residue_removed = residue
+            if residue != pager_hits:
+                cap.notes.append(
+                    f"pager answered {pager_hits} time(s) but {residue} erase "
+                    "run(s) were removed from the captured text. The raw "
+                    "capture is written as received; check it before trusting "
+                    "this command's parse.")
             if self._looks_like_cli_error(cap.text):
                 # The firmware rejected the command. On an optional read
                 # that is a discovery result in itself -- this release does
@@ -464,9 +497,13 @@ class IstaxSession:
         return self._record(cap)
 
     @staticmethod
-    def _clean(raw: str, command: str) -> str:
-        """Strip the echoed command and the trailing prompt."""
+    def _clean(raw: str, command: str) -> Tuple[str, int]:
+        """Strip the echoed command, the trailing prompt and pager residue.
+
+        Returns the cleaned text and how many pager erase runs were removed.
+        """
         text = strip_ansi(raw)
+        text, residue = PAGER_RESIDUE_RE.subn("", text)
         lines = text.split("\n")
         # drop the echo of the command itself (first line containing it)
         for i, line in enumerate(lines[:3]):
@@ -476,7 +513,7 @@ class IstaxSession:
         # drop the trailing prompt line
         while lines and (PROMPT_RE.search(lines[-1]) or not lines[-1].strip()):
             lines.pop()
-        return "\n".join(lines).rstrip() + "\n"
+        return "\n".join(lines).rstrip() + "\n", residue
 
     @staticmethod
     def _looks_like_cli_error(text: Optional[str]) -> bool:

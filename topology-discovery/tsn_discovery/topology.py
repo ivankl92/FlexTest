@@ -357,6 +357,7 @@ class TopologyBuilder:
             for l in self.links if l["method"] == "lldp"
         }
         seen_attachments = set()
+        noted_via_trunk = set()
 
         for sw, rec in self.records.items():
             port_names = self._port_ref_map(rec)
@@ -378,10 +379,16 @@ class TopologyBuilder:
                             if attachment in lldp_pairs:
                                 continue      # LLDP already said this
                             if str(pname) in claimed.get(sw, set()):
-                                self.notes.append(
-                                    f"{dev.name} ({mac}) learned on {sw}:{pname}, "
-                                    "which is an inter-switch link -- not treated "
-                                    "as an attachment")
+                                # The same device is learned on the same trunk
+                                # once per VLAN it is active in, and the note
+                                # says nothing new the second time.
+                                if attachment not in noted_via_trunk:
+                                    noted_via_trunk.add(attachment)
+                                    self.notes.append(
+                                        f"{dev.name} ({mac}) learned on "
+                                        f"{sw}:{pname}, which is an "
+                                        "inter-switch link -- not treated as "
+                                        "an attachment")
                                 continue
                             n = self.node(dev.name, dev.role, dev.name)
                             n.discovered = True
@@ -461,11 +468,57 @@ class TopologyBuilder:
                 "endpoints_in_inventory_not_observed.",
         }
 
+    def silent_link_up_ports(self) -> List[dict]:
+        """Ports with a link and nothing on the other side of discovery.
+
+        Both discovery methods need the neighbour to say something: LLDP
+        needs it to send LLDPDUs, the filtering database needs it to send a
+        frame. A device that does neither is invisible, and the honest report
+        of that is not silence but "something is plugged in here and it has
+        not spoken". In this testbed that is exactly the four Raspberry Pis,
+        which the inventory cross-check lists as unobserved without ever
+        connecting the two facts.
+        """
+        attached = {}
+        for link in self.links:
+            for end in ("a", "b"):
+                node, port = link[end]["node"], link[end].get("port")
+                if port:
+                    attached.setdefault(node, set()).add(str(port))
+
+        out: List[dict] = []
+        for sw, rec in sorted(self.records.items()):
+            for iface in rec.get("interfaces", []):
+                name = iface.get("name")
+                if iface.get("oper_status") != "up" or not name:
+                    continue
+                if str(name) in attached.get(sw, set()):
+                    continue
+                out.append({
+                    "switch": sw,
+                    "port": name,
+                    "speed_mbps": iface.get("speed_mbps"),
+                    "reason": "link is up, but no LLDP neighbour and no "
+                              "filtering-database entry resolve to a known "
+                              "device on this port",
+                    "hint": "a device that neither runs LLDP nor has "
+                            "transmitted recently is invisible to both "
+                            "methods. Generate traffic from it and re-run.",
+                })
+        return out
+
     def build(self) -> dict:
         self.seed_from_inventory()
         self.seed_from_discovery()
         self.add_lldp_links()
         self.add_fdb_attachments()
+
+        silent = self.silent_link_up_ports()
+        if silent:
+            listed = ", ".join(f"{p['switch']}:{p['port']}" for p in silent)
+            self.notes.append(
+                f"{len(silent)} port(s) have a link but nothing identified on "
+                f"it: {listed}. Something is cabled there and has not spoken.")
 
         lldp_links = [l for l in self.links if l["method"] == "lldp"]
         fdb_links = [l for l in self.links if l["method"] == "fdb"]
@@ -491,6 +544,7 @@ class TopologyBuilder:
                 "fdb_attachments": len(fdb_links),
             },
             "unresolved_lldp_neighbours": self.unresolved,
+            "silent_link_up_ports": silent,
             "crosscheck": self.crosscheck(),
             "notes": self.notes,
         }

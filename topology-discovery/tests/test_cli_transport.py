@@ -215,8 +215,36 @@ class TestTableParsing(unittest.TestCase):
         self.assertEqual(rows[0]["Interfaces"], "Gi 1/1-6 2.5G 1/1-2")
 
     def test_multiple_tables_in_one_output(self):
+        """`show ptp 0 default` prints four tables in one output on
+        GA-3.06: the clock, its quality, the protocol settings, and the
+        gmCapable/sdoId pair."""
         tables = P.parse_tables(fix.PTP_DEFAULT)
-        self.assertEqual(len(tables), 3)
+        self.assertEqual(len(tables), 4)
+
+    def test_pager_residue_row_is_recovered(self):
+        """The firmware erases its `-- more --` prompt with a run of spaces
+        and writes the next row on that same line. Slicing by column would
+        read the displaced row as empty and drop it -- one FDB entry per
+        paged command, silently."""
+        clean = "Dynamic 1    00:bb:cc:dd:ee:12 GigabitEthernet 1/1"
+        self.assertIn(clean, SAMPLE_MAC)
+        displaced = SAMPLE_MAC.replace(clean, " " * 51 + clean, 1)
+        self.assertEqual(P.parse_table(displaced), P.parse_table(SAMPLE_MAC))
+
+    def test_right_aligned_value_is_not_mistaken_for_residue(self):
+        """`show ptp 0 current` indents a genuine value 31 columns. The
+        residue test is geometric, not a space count, so this survives."""
+        rows = P.parse_tables(fix.PTP_CURRENT)[1]
+        self.assertEqual(rows[0]["lastGMPhaseChange"], "0.000,000,000")
+
+    def test_value_wider_than_its_dashes_is_not_truncated(self):
+        """ParentPortIdentity is a 22-dash column holding a 23-character
+        clock identity. Slicing to the dash width loses the last byte of
+        every identity -- and two clock identities that differ only in the
+        last byte then compare equal."""
+        rows = P.parse_tables(fix.PTP_PARENT)[0]
+        self.assertEqual(rows[0]["ParentPortIdentity"],
+                         "00:80:82:ff:fe:b9:65:33")
 
 
 # --- per-command parsers -------------------------------------------------
@@ -290,8 +318,13 @@ class TestRunningConfig(unittest.TestCase):
         self.assertEqual(self.cfg["hostname"], "KSwitchTSN-1")
         self.assertEqual(self.cfg["management_ip"], "192.168.1.10")
 
-    def test_bridge_address_from_mst_name(self):
-        self.assertEqual(self.cfg["bridge_address"], "00:80:82:b9:65:33")
+    def test_mst_region_name_is_not_taken_for_the_bridge_address(self):
+        """It is a region name that happens to look like a MAC. On four of
+        the five switches in this testbed it is 00-22-33-44-55-66, which is
+        not their address, so it is recorded as what it is and nothing else
+        reads it as an address."""
+        self.assertEqual(self.cfg["mst_region_name"], "00-80-82-b9-65-33")
+        self.assertNotIn("bridge_address", self.cfg)
 
     def test_netconf_server_is_configured(self):
         """The evidence that this is a firmware fault, not a missing setting."""
@@ -387,9 +420,9 @@ class TestPtp(unittest.TestCase):
         self.assertTrue(self.record["gptp_profile"])
 
     def test_offset_converted_to_nanoseconds(self):
-        """"-0.000,000,000,386" seconds is -0.386 ns."""
+        """"-0.000,000,001,028" seconds is -1.028 ns."""
         self.assertAlmostEqual(
-            self.record["sync_summary"]["offset_from_master_ns"], -0.386,
+            self.record["sync_summary"]["offset_from_master_ns"], -1.028,
             places=6)
 
     def test_all_three_models_emitted(self):
@@ -419,8 +452,10 @@ class TestPtp(unittest.TestCase):
     def test_ietf_ptp_port_states_keep_2008_role_names(self):
         ports = self.record["models"]["ietf-ptp"]["instance-list"][0]["port-ds-list"]
         states = {p["port-number"]: p["port-state"] for p in ports}
-        self.assertEqual(states[5], "slave")
-        self.assertEqual(states[1], "master")
+        self.assertEqual(states[4], "slave")
+        self.assertEqual(states[5], "master")
+        self.assertEqual(states[6], "listening")
+        self.assertEqual(states[1], "disabled")
 
     def test_clock_quality_decomposed(self):
         ds = self.record["models"]["ietf-ptp"]["instance-list"][0]["default-ds"]
@@ -438,8 +473,9 @@ class TestPtp(unittest.TestCase):
         inst = self.record["models"]["ieee1588-ptp-tt"]["instances"]["instance"][0]
         states = {p["port-number"]: p["port-ds"]["port-state"]
                   for p in inst["ports"]["port"]}
-        self.assertEqual(states[5], "time-receiver")
-        self.assertEqual(states[1], "time-transmitter")
+        self.assertEqual(states[4], "time-receiver")
+        self.assertEqual(states[5], "time-transmitter")
+        self.assertEqual(states[1], "disabled")
 
     def test_ieee1588_nests_ports(self):
         """1588-2019 uses ports/port/port-ds, not a flat port-ds-list."""
@@ -481,17 +517,44 @@ class TestPtp(unittest.TestCase):
         ports = self.record["models"]["ieee802-dot1as-gptp"]["augments"][
             "ports/port/port-ds"]
         by_num = {p["port-number"]: p for p in ports}
-        self.assertTrue(by_num[5]["is-measuring-delay"])
-        self.assertEqual(by_num[5]["current-log-sync-interval"], -3)
+        self.assertEqual(by_num[4]["current-log-sync-interval"], -3)
+        self.assertEqual(by_num[4]["gptp-port-role"], "Slave")
 
-    def test_as_capable_is_not_invented(self):
-        """The most useful gPTP predicate is not printed by the CLI. It must
-        be absent and the absence explained, not guessed from Peer-delay."""
+    def test_as_capable_is_read_not_guessed(self):
+        """`show ptp 0 port-state` prints an `802.1AS port status` table with
+        an as-cap column. An earlier version declared this leaf unobtainable
+        and never parsed that table; the values below come from it."""
+        ports = self.record["models"]["ieee802-dot1as-gptp"]["augments"][
+            "ports/port/port-ds"]
+        by_num = {p["port-number"]: p for p in ports}
+        self.assertTrue(by_num[4]["as-capable"])
+        self.assertTrue(by_num[5]["as-capable"])
+        self.assertFalse(by_num[6]["as-capable"])
+        self.assertFalse(by_num[1]["as-capable"])
+
+    def test_is_measuring_delay_comes_from_its_own_column(self):
+        """Not from Peer-delay OK/FAIL, which is link health and a different
+        assertion. Port 1 is Peer-delay OK but is-mes-del False; reading the
+        wrong column reports it as measuring."""
+        ports = self.record["models"]["ieee802-dot1as-gptp"]["augments"][
+            "ports/port/port-ds"]
+        by_num = {p["port-number"]: p for p in ports}
+        self.assertFalse(by_num[1]["is-measuring-delay"])
+        self.assertEqual(by_num[1]["peer-delay-mechanism-status"], "OK")
+        self.assertTrue(by_num[4]["is-measuring-delay"])
+
+    def test_neighbor_rate_ratio_keeps_its_raw_integer(self):
+        """The column is unlabelled, so the 2^41 wire scaling is an
+        interpretation. It is applied, declared as derived, and the integer
+        is kept so it can be checked."""
+        ports = self.record["models"]["ieee802-dot1as-gptp"]["augments"][
+            "ports/port/port-ds"]
+        by_num = {p["port-number"]: p for p in ports}
+        self.assertEqual(by_num[4]["neighbor-rate-ratio-scaled"], 241)
+        self.assertAlmostEqual(by_num[4]["neighbor-rate-ratio"],
+                               1.0 + 241 / float(1 << 41), places=15)
         m = self.record["models"]["ieee802-dot1as-gptp"]
-        ports = m["augments"]["ports/port/port-ds"]
-        for port in ports:
-            self.assertNotIn("as-capable", port)
-        self.assertTrue(any("as-capable" in u for u in m["unavailable"]))
+        self.assertTrue(any("neighbor-rate-ratio" in d for d in m["derived"]))
 
     def test_every_model_declares_gaps_and_inferences(self):
         for key, model in self.record["models"].items():
@@ -507,14 +570,52 @@ class TestPtp(unittest.TestCase):
                             for p in ports))
 
     def test_grandmaster_identity(self):
+        """SW2's own clock is bd:25:7c and its grandmaster is b9:65:33
+        (SW1), one step removed. The two must not be conflated -- that is
+        what separates a synchronised switch from the reference itself."""
         self.assertEqual(self.record["sync_summary"]["grandmaster_identity"],
+                         "00:80:82:ff:fe:b9:65:33")
+        self.assertEqual(self.record["sync_summary"]["clock_identity"],
                          "00:80:82:ff:fe:bd:25:7c")
+        self.assertFalse(self.record["sync_summary"]["is_grandmaster"])
 
     def test_lock_verdict_and_caveat(self):
         lock = ptp_mod.lock_assessment(self.record)
         self.assertEqual(lock["verdict"], "locked")
         self.assertTrue(lock["safe_to_schedule"])
         self.assertIn("one sample", lock["caveat"].lower())
+
+    def test_grandmaster_is_not_reported_as_locked(self):
+        """A grandmaster reports zero offset and a free-running servo
+        because it is the reference, not because anything verified it.
+        Calling that `locked` hands a CNC a check that never happened."""
+        record = dict(self.record)
+        summary = dict(record["sync_summary"])
+        summary["is_grandmaster"] = True
+        summary["clock_identity"] = "00:80:82:ff:fe:b9:65:33"
+        summary["offset_from_master_ns"] = 0.0
+        summary["clock_class"] = 248
+        summary["time_source"] = 160
+        record["sync_summary"] = summary
+
+        lock = ptp_mod.lock_assessment(record)
+        self.assertEqual(lock["verdict"], "grandmaster")
+        self.assertTrue(lock["safe_to_schedule"])
+        self.assertFalse(lock["traceable_to_external_reference"])
+        self.assertIn("oscillator", lock["caveat"])
+
+    def test_as_capable_false_on_the_syncing_port_is_a_contradiction(self):
+        """A healthy offset read through a port that says it is not
+        gPTP-capable is two readings that cannot both be right."""
+        record = dict(self.record)
+        summary = dict(record["sync_summary"])
+        summary["port_states"] = {"Gi 1/4": "slave"}
+        summary["as_capable"] = {"Gi 1/4": False}
+        record["sync_summary"] = summary
+
+        lock = ptp_mod.lock_assessment(record)
+        self.assertEqual(lock["verdict"], "inconsistent")
+        self.assertFalse(lock["safe_to_schedule"])
 
     def test_out_of_tolerance_offset_is_refused(self):
         lock = ptp_mod.lock_assessment(self.record, threshold_ns=0.001)
@@ -719,3 +820,87 @@ def _configured_interfaces():
     ifaces = P.parse_interfaces(result)
     P.apply_interface_config(ifaces, cfg)
     return ifaces
+
+
+# --- QoS -----------------------------------------------------------------
+
+class TestQos(unittest.TestCase):
+    """`show qos interface` carries the answer to the one question Qbv
+    cannot answer for itself: which traffic class does a tagged frame land
+    in. An earlier version read only the queue shapers and threw the rest
+    away, which hid both facts asserted below."""
+
+    def setUp(self):
+        self.qos = P._parse_qos(fix.QOS)
+
+    def test_ingress_trust_is_read(self):
+        classification = self.qos["values"]["ingress-classification"]
+        self.assertIn("trust_tag", classification)
+        self.assertIn("default_cos", classification)
+
+    def test_priority_regeneration_map_is_read(self):
+        regen = self.qos["values"]["priority_regeneration"]
+        self.assertEqual(len(regen), 8)
+        for pcp, tc in regen.items():
+            self.assertIn(int(pcp), range(8))
+            self.assertIn(tc, range(8))
+
+    def test_nothing_is_silently_discarded(self):
+        """Every `qos` line lands in a named field or in `vendor`. A line
+        that matches nothing is recorded under `unparsed` rather than
+        dropped, so a firmware that adds output is noticed."""
+        vendor = self.qos["values"].get("vendor", {})
+        self.assertEqual(vendor.get("unparsed", []), [])
+
+
+class TestQbuPriorityMapping(unittest.TestCase):
+    """802.1Q's recommended default swaps PCP 0 and PCP 1, so "queue N is
+    priority N" is wrong out of the box on this hardware."""
+
+    NON_IDENTITY = {"0": 1, "1": 0, "2": 2, "3": 3,
+                    "4": 4, "5": 5, "6": 6, "7": 7}
+
+    def test_identity_map_maps_queue_n_to_priority_n(self):
+        qbu = P._fp_status_to_qbu({}, [0, 1], {str(i): i for i in range(8)})
+        self.assertEqual(qbu["configuration"]["preemptable_priorities"],
+                         ["priority0", "priority1"])
+        self.assertTrue(
+            qbu["configuration"]["priority_regeneration_is_identity"])
+
+    def test_swapped_map_is_applied_not_assumed(self):
+        """Queues 2 and 3 are preemptable. Under the swapped map those are
+        still priorities 2 and 3 -- but make queue 0 preemptable and the
+        priority that reaches it is 1, not 0."""
+        qbu = P._fp_status_to_qbu({}, [0], self.NON_IDENTITY)
+        self.assertEqual(qbu["configuration"]["preemptable_priorities"],
+                         ["priority1"])
+        self.assertFalse(
+            qbu["configuration"]["priority_regeneration_is_identity"])
+        self.assertIn("NOT the identity", qbu["mapping_note"])
+
+    def test_unknown_map_says_so_rather_than_assuming(self):
+        qbu = P._fp_status_to_qbu({}, [0], None)
+        self.assertIn("was not read", qbu["mapping_note"])
+
+
+class TestTickGranularity(unittest.TestCase):
+    def test_value_and_unit_share_the_field(self):
+        self.assertEqual(P._tick_granularity("1 tenths of nanoseconds"), 1)
+
+    def test_unexpected_unit_is_left_unread(self):
+        """802.1Q's leaf is in tenths of a nanosecond. A firmware printing
+        anything else would need rescaling, and a wrong scale here is worse
+        than a null."""
+        self.assertIsNone(P._tick_granularity("1 microseconds"))
+
+
+class TestCreditBasedShaper(unittest.TestCase):
+    def test_credit_enabled_shaper_is_recognised_as_cbs(self):
+        """802.1Qav has no YANG module on this hardware, but a queue shaper
+        with credit enabled is a credit-based shaper by another name, and a
+        CNC reasoning about bandwidth reservation needs to know."""
+        qos = P._parse_qos(fix.QOS_WITH_CBS)
+        self.assertTrue(qos["credit_based_shaper_active"])
+
+    def test_no_credit_shaper_makes_no_claim(self):
+        self.assertNotIn("credit_based_shaper_active", P._parse_qos(fix.QOS))

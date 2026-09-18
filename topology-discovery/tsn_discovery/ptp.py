@@ -241,36 +241,99 @@ def _observe_time_properties(text: Optional[str]) -> dict:
     return out
 
 
+# `neighborRateRatio` travels on the wire as (ratio - 1.0) scaled by 2^41
+# (IEEE 802.1AS-2020, 11.4.3). The CLI prints the scaled integer with no
+# unit, so the conversion below is an interpretation of an undocumented
+# column, not a reading -- it is recorded as `derived` and the raw integer is
+# kept beside it.
+_RATE_RATIO_SCALE = float(1 << 41)
+
+
 def _observe_ports(text: Optional[str],
                    interface: Optional[str] = None) -> List[dict]:
-    """`show ptp 0 port-state`. The virtual-port table that follows the
-    physical one is skipped: a virtual port is not a PTP network port and
-    carrying it into port-ds would invent an interface."""
-    out: List[dict] = []
+    """`show ptp 0 port-state`.
+
+    The command prints three tables. The first is the PTP port state, the
+    second is a virtual-port table (skipped -- a virtual port is not a PTP
+    network port, and carrying it into port-ds would invent an interface),
+    and the third, headed ``802.1AS port status:``, holds the gPTP state:
+    ``as-cap``, ``is-mes-del``, the neighbour rate ratio and the mean
+    propagation delay. The two real tables are keyed by the same port number
+    and merged here, so one port yields one observation.
+    """
+    by_port: Dict[int, dict] = {}
+    order: List[int] = []
+
+    def slot(number: Optional[int]) -> Optional[dict]:
+        if number is None:
+            return None
+        if number not in by_port:
+            by_port[number] = {"port_number": number}
+            order.append(number)
+            if interface:
+                by_port[number]["interface"] = canonical_ifname(interface)
+        return by_port[number]
+
     for rows in parse_tables(text):
         for row in rows:
             if _row_get(row, "VirtualPort") is not None:
                 continue
-            port = _row_get(row, "Port")
-            if port is None:
+            entry = slot(to_int(_row_get(row, "Port")))
+            if entry is None:
                 continue
-            state = (_row_get(row, "PTP-State") or "").strip().lower()
-            entry = {
-                "port_number": to_int(port),
-                "port_state": PORT_STATE_MAP.get(state, state or None),
-                "port_state_raw": state or None,
-                "enabled": _flag(_row_get(row, "Enabled")),
-                "internal": _flag(_row_get(row, "Internal")),
-                "link": _row_get(row, "Link"),
-                "port_timer": _row_get(row, "Port-Timer"),
-                "vlan_forward": _row_get(row, "Vlan-forw"),
-                "phy_timestamper": _flag(_row_get(row, "Phy-timestamper")),
-                "peer_delay_status": _row_get(row, "Peer-delay"),
-            }
-            if interface:
-                entry["interface"] = canonical_ifname(interface)
-            out.append(entry)
-    return out
+
+            if _row_get(row, "PTP-State") is not None:
+                state = (_row_get(row, "PTP-State") or "").strip().lower()
+                entry.update({
+                    "port_state": PORT_STATE_MAP.get(state, state or None),
+                    "port_state_raw": state or None,
+                    "enabled": _flag(_row_get(row, "Enabled")),
+                    "internal": _flag(_row_get(row, "Internal")),
+                    "link": _row_get(row, "Link"),
+                    "port_timer": _row_get(row, "Port-Timer"),
+                    "vlan_forward": _row_get(row, "Vlan-forw"),
+                    "phy_timestamper": _flag(_row_get(row, "Phy-timestamper")),
+                    # OK/FAIL for the peer-delay mechanism on this link. This
+                    # is link health, NOT isMeasuringDelay -- an earlier
+                    # version mapped it to that leaf and got it wrong on
+                    # every port.
+                    "peer_delay_status": _row_get(row, "Peer-delay"),
+                })
+                continue
+
+            if _row_get(row, "as-cap") is not None or \
+                    _row_get(row, "port-role") is not None:
+                rate_raw = to_int(_row_get(row, "rate-ratio"))
+                entry.update(_prune({
+                    "gptp_port_role": _row_get(row, "port-role"),
+                    "is_measuring_delay": _flag(_row_get(row, "is-mes-del")),
+                    "as_capable": _flag(_row_get(row, "as-cap")),
+                    "neighbor_rate_ratio_scaled": rate_raw,
+                    "neighbor_rate_ratio": (
+                        1.0 + rate_raw / _RATE_RATIO_SCALE
+                        if rate_raw is not None else None),
+                    "current_log_announce_interval_gptp":
+                        to_int(_row_get(row, "cur-anv")),
+                    "current_log_sync_interval_gptp":
+                        to_int(_row_get(row, "cur-syv")),
+                    "sync_receipt_timeout_interval_ns":
+                        _seconds_to_ns(_row_get(row, "sync-time-intrv")),
+                    # currentMeanPropagationDelay. The column carries a bare
+                    # integer with no unit and every port in this testbed
+                    # reads 0, so there is nothing to infer a scale from --
+                    # 1588 TimeInterval is 2^-16 ns, but that is a guess
+                    # until a non-zero value appears. Kept unconverted.
+                    "mean_link_delay_raw": to_int(_row_get(row, "cur-MPR")),
+                    "asymmetry_measurement_mode": _flag(_row_get(row, "AMTE")),
+                    "compute_neighbor_rate_ratio":
+                        _flag(_row_get(row, "comp-ratio")),
+                    "compute_mean_link_delay":
+                        _flag(_row_get(row, "comp-delay")),
+                    "gptp_version": to_int(_row_get(row, "version")),
+                    "gptp_minor_version": to_int(_row_get(row, "minor-ver")),
+                }))
+
+    return [by_port[n] for n in order]
 
 
 def _observe_servo(text: Optional[str]) -> dict:
@@ -685,19 +748,41 @@ def project_dot1as(obs: dict) -> dict:
 
     port_ds_aug = []
     for p in obs["ports"]:
-        measuring = _flag(p.get("peer_delay_status"))
         port_ds_aug.append(_prune({
             "port-number": p.get("port_number"),
             "underlying-interface": p.get("interface"),
-            "is-measuring-delay": measuring,
-            "as-capable": None,
-            "current-log-sync-interval": p.get("log_sync_interval"),
-            "current-log-announce-interval": p.get("log_announce_interval"),
+            # Read from the `802.1AS port status` table, not inferred.
+            "as-capable": p.get("as_capable"),
+            "is-measuring-delay": p.get("is_measuring_delay"),
+            "neighbor-rate-ratio": p.get("neighbor_rate_ratio"),
+            "neighbor-rate-ratio-scaled": p.get("neighbor_rate_ratio_scaled"),
+            "compute-neighbor-rate-ratio": p.get("compute_neighbor_rate_ratio"),
+            "compute-mean-link-delay": p.get("compute_mean_link_delay"),
+            "asymmetry-measurement-mode": p.get("asymmetry_measurement_mode"),
+            "mean-link-delay-raw": p.get("mean_link_delay_raw"),
+            "version-number": p.get("gptp_version"),
+            "minor-version-number": p.get("gptp_minor_version"),
+            # The 802.1AS table prints the *current* intervals; the
+            # running-config prints what was configured. Where both exist the
+            # operational value wins and the configured one is kept beside it.
+            "current-log-sync-interval": (
+                p.get("current_log_sync_interval_gptp")
+                if p.get("current_log_sync_interval_gptp") is not None
+                else p.get("log_sync_interval")),
+            "current-log-announce-interval": (
+                p.get("current_log_announce_interval_gptp")
+                if p.get("current_log_announce_interval_gptp") is not None
+                else p.get("log_announce_interval")),
+            "configured-log-sync-interval": p.get("log_sync_interval"),
             "current-log-pdelay-req-interval": (
                 p.get("log_min_delay_req_interval")
                 if p.get("delay_mechanism") == "p2p" else None),
             "current-log-gptp-cap-interval": p.get("log_gptp_cap_interval"),
             "sync-receipt-timeout": p.get("announce_receipt_timeout"),
+            "sync-receipt-timeout-time-interval-ns":
+                p.get("sync_receipt_timeout_interval_ns"),
+            "gptp-port-role": p.get("gptp_port_role"),
+            "peer-delay-mechanism-status": p.get("peer_delay_status"),
         }))
 
     return {
@@ -722,30 +807,41 @@ def project_dot1as(obs: dict) -> dict:
             "ports/port/port-ds": port_ds_aug or None,
         },
         "unavailable": [
-            "port-ds/as-capable — the single most useful gPTP predicate, and "
-            "the CLI does not print it. `show ptp 0 port-state` reports "
-            "Peer-delay status, which is evidence that the peer delay "
-            "mechanism is running but is not the same assertion.",
-            "port-ds/neighbor-rate-ratio, mean-link-delay-thresh, "
-            "neg-mean-link-delay-thresh, sync-locked, allowed-lost-responses, "
-            "one-step-tx-oper — not printed",
+            "port-ds/mean-link-delay-thresh, neg-mean-link-delay-thresh, "
+            "sync-locked, allowed-lost-responses, one-step-tx-oper — "
+            "not printed",
+            "port-ds/mean-link-delay — `cur-MPR` is printed but carries no "
+            "unit and reads 0 on every port here, so there is nothing to "
+            "infer a scale from. The raw integer is kept as "
+            "mean-link-delay-raw rather than converted on a guess.",
             "port-statistics-ds — the counters exist in the web UI "
             "(Monitor → Ports → Detailed Statistics) but not in a `show` "
             "command this collector issues",
-            "default-ds/gm-capable — not printed",
             "current-ds/last-gm-phase-change, gm-timebase-indicator, "
             "gm-change-count — not printed",
             "parent-ds/cumulative-rate-ratio — not printed",
             "common-services/cmlds — not exposed",
         ],
         "derived": [
-            "port-ds/is-measuring-delay — from the Peer-delay column of "
-            "`show ptp 0 port-state` (OK is read as measuring)",
+            "port-ds/neighbor-rate-ratio — the `rate-ratio` column is an "
+            "unlabelled integer; it is read as the wire encoding "
+            "(ratio - 1.0) × 2^41 from IEEE 802.1AS-2020 11.4.3. The raw "
+            "integer is kept as neighbor-rate-ratio-scaled so the "
+            "interpretation can be checked or discarded.",
             "port-ds/current-log-pdelay-req-interval — from "
             "`ptp 0 delay-req interval` where the delay mechanism is p2p",
             "port-ds/sync-receipt-timeout — from the timeout operand of "
             "`ptp 0 announce interval <n> timeout <m>`; the CLI does not "
             "separate announce and sync receipt timeouts",
+        ],
+        "read_not_inferred": [
+            "port-ds/as-capable and port-ds/is-measuring-delay come from the "
+            "`as-cap` and `is-mes-del` columns of the `802.1AS port status` "
+            "table in `show ptp 0 port-state`. An earlier version of this "
+            "collector declared as-capable unobtainable and derived "
+            "is-measuring-delay from the Peer-delay OK/FAIL column, which is "
+            "peer-delay link health and a different assertion; both were "
+            "wrong and both are now read.",
         ],
     }
 
@@ -806,14 +902,36 @@ def build(result, running_cfg: dict, interfaces: List[dict]) -> dict:
             "servo_state": servo.get("slave_state"),
             "holdover_ppb": servo.get("holdover_ppb"),
             "grandmaster_identity": obs["parent"].get("gm_identity"),
+            "clock_identity": obs["clock"].get("clock_identity"),
+            "is_grandmaster": _is_grandmaster(obs),
+            "clock_class": (obs["clock"].get("clock_quality") or {})
+                           .get("clock-class"),
+            "time_source": obs["time_properties"].get("time_source"),
             "port_states": {p.get("interface") or p.get("port_number"):
                             p.get("port_state") for p in obs["ports"]
                             if p.get("port_state")},
+            "as_capable": {p.get("interface") or p.get("port_number"):
+                           p.get("as_capable") for p in obs["ports"]
+                           if p.get("as_capable") is not None},
         },
         "evidence": "show ptp 0 default / current / parent / time-property / "
                     "port-state / slave, plus 'ptp' lines in "
                     "show running-config",
     }
+
+
+def _is_grandmaster(obs: dict) -> Optional[bool]:
+    """True when this switch is the grandmaster of its own domain.
+
+    Decided by identity, not by steps-removed alone: the grandmaster's
+    parent-ds names its own clock. steps-removed 0 corroborates it.
+    """
+    own = (obs.get("clock") or {}).get("clock_identity")
+    gm = (obs.get("parent") or {}).get("gm_identity")
+    if not own or not gm:
+        steps = (obs.get("current") or {}).get("steps_removed")
+        return True if steps == 0 else None
+    return own == gm
 
 
 def lock_assessment(ptp_record: dict,
@@ -824,6 +942,11 @@ def lock_assessment(ptp_record: dict,
     is advisory and says so: a single offset sample is not a synchronisation
     guarantee, and the honest answer when PTP is not readable at all is
     "unknown", not "fine".
+
+    A grandmaster gets its own verdict rather than `locked`. It reports zero
+    offset and a free-running servo because it is the reference, not because
+    anything checked it; calling that "locked" would hand a CNC a
+    verification that never happened.
     """
     if ptp_record.get("status") != "available-via-cli":
         return {
@@ -840,6 +963,40 @@ def lock_assessment(ptp_record: dict,
                 "reason": "no offset and no port state reported",
                 "safe_to_schedule": False}
 
+    if summary.get("is_grandmaster"):
+        clock_class = summary.get("clock_class")
+        source = summary.get("time_source")
+        traceable = clock_class is not None and clock_class < 128
+        return {
+            "verdict": "grandmaster",
+            "reason": (
+                "this switch is the grandmaster of its own domain "
+                f"(clock identity {summary.get('clock_identity')}), so its "
+                "offset of 0 ns and free-running servo are definitional, not "
+                "a measurement"),
+            "offset_ns": offset,
+            "clock_class": clock_class,
+            "time_source": source,
+            "traceable_to_external_reference": traceable,
+            "safe_to_schedule": True,
+            "caveat": (
+                "Nothing inside the network can verify a grandmaster's time "
+                "base. " + (
+                    "This one advertises clock class "
+                    f"{clock_class}" + (
+                        " and time source 0x%02X" % source
+                        if isinstance(source, int) else "") +
+                    ", which is not traceable to an external reference — the "
+                    "whole network is disciplined to this switch's local "
+                    "oscillator. That is fine for relative measurements "
+                    "between ports of this network and meaningless as an "
+                    "absolute time base."
+                    if not traceable else
+                    "This one advertises a traceable clock class "
+                    f"({clock_class}); confirm the upstream source "
+                    "separately.")),
+        }
+
     if states and all(s in ("disabled", "initializing", "faulty")
                       for s in states):
         return {"verdict": "not-synchronised",
@@ -853,15 +1010,36 @@ def lock_assessment(ptp_record: dict,
                 "offset_ns": offset,
                 "safe_to_schedule": False}
 
-    return {
+    as_capable = summary.get("as_capable") or {}
+    not_as_capable = sorted(k for k, v in as_capable.items() if v is False)
+    sync_ports = [k for k, v in (summary.get("port_states") or {}).items()
+                  if v in ("slave", "time-receiver")]
+    sync_not_capable = [p for p in sync_ports if as_capable.get(p) is False]
+
+    out = {
         "verdict": "locked" if offset is not None else "running",
         "reason": (f"offset from master {offset:.1f} ns within "
                    f"{threshold_ns:.0f} ns" if offset is not None
                    else "PTP ports active, no offset sample"),
         "offset_ns": offset,
         "safe_to_schedule": offset is not None,
-        "caveat": "One sample, and as-capable is not readable over the CLI. A "
-                  "schedule campaign should re-check before and after each "
-                  "measurement point, as i226-adaptation does with pmc on the "
-                  "end stations.",
+        "caveat": "One sample. A schedule campaign should re-check before and "
+                  "after each measurement point, as i226-adaptation does with "
+                  "pmc on the end stations.",
     }
+    if as_capable:
+        out["as_capable_ports"] = sorted(k for k, v in as_capable.items() if v)
+        if not_as_capable:
+            out["not_as_capable_ports"] = not_as_capable
+    if sync_not_capable:
+        # The port the switch is synchronising through says it is not
+        # gPTP-capable. That contradicts the offset reading, so neither can
+        # be trusted on its own.
+        out["verdict"] = "inconsistent"
+        out["safe_to_schedule"] = False
+        out["reason"] = (
+            f"offset from master {offset:.1f} ns looks healthy, but the "
+            f"synchronising port(s) {sync_not_capable} report as-capable "
+            "false" if offset is not None else
+            f"synchronising port(s) {sync_not_capable} report as-capable false")
+    return out

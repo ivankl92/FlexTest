@@ -268,6 +268,56 @@ def build(records: Dict[str, dict], topo: dict, inventory,
                           "it into per-port Qbv gate-control lists.",
         })
 
+    # Ingress classification. A Qbv schedule gates traffic classes; if the
+    # bridge does not derive the traffic class from the frame's PCP, every
+    # frame lands in the port's default class no matter how the talker tags
+    # it, and gates on the other classes open onto empty queues. This is
+    # configuration rather than a missing capability, but it defeats
+    # scheduling just as completely, so it belongs in the same list.
+    untrusted = []
+    non_identity = []
+    for name, rec in sorted(records.items()):
+        for iface in rec.get("interfaces", []):
+            if not iface.get("is_bridge_port"):
+                continue
+            values = (iface.get("qos") or {}).get("values") or {}
+            classification = values.get("ingress-classification") or {}
+            if classification.get("trust_tag") is False:
+                untrusted.append(f"{name}:{iface.get('name')}")
+            if values.get("priority_regeneration_is_identity") is False:
+                non_identity.append(f"{name}:{iface.get('name')}")
+
+    if untrusted:
+        gaps.append({
+            "capability": "ingress-classification",
+            "impact": "blocking-for-scheduling",
+            "detail": f"{len(untrusted)} bridge port(s) have `qos trust tag "
+                      "disabled`, so the PCP a talker sets is ignored and "
+                      "every frame is classified to the port's default "
+                      "traffic class. A Qbv gate-control list that opens "
+                      "classes 1-7 would gate empty queues. This is a "
+                      "configuration state, not a missing capability -- the "
+                      "hardware can do it.",
+            "ports": untrusted,
+            "workaround": "Enable tag trust on the ports carrying scheduled "
+                          "traffic before installing any schedule, and "
+                          "re-run discovery to confirm.",
+        })
+    if non_identity:
+        gaps.append({
+            "capability": "priority-regeneration",
+            "impact": "operational",
+            "detail": f"{len(non_identity)} port(s) map PCP to traffic class "
+                      "by something other than the identity, so a stream's "
+                      "PCP is not its gate index. The map is read per port "
+                      "and recorded under qos/priority_regeneration; a CNC "
+                      "must apply it when turning a stream priority into a "
+                      "gate.",
+            "ports": non_identity,
+            "workaround": "Use the per-port map rather than assuming PCP N "
+                          "means traffic class N.",
+        })
+
     gaps.append({
         "capability": "datastore-coherence",
         "impact": "operational",
