@@ -24,7 +24,10 @@ from typing import Dict, List, Optional
 
 from . import SCHEMA_VERSION, __version__
 from . import capabilities as caps_mod
+from . import cli_record as cli_record_mod
 from . import cnc as cnc_mod
+from . import istax
+from . import istax_parse as istax_parse_mod
 from . import netconf as nc
 from . import probe as probe_mod
 from . import render as render_mod
@@ -32,8 +35,13 @@ from . import topology as topo_mod
 from .inventory import parse_system_md, switch_targets
 
 DEFAULT_USER = "netconf"
-DEFAULT_PASSWORD = "geheim"          # lab default, documented in SYSTEM.md
+# AN001 v1.3 documents the NETCONF default as netconf/netconf; SYSTEM.md
+# records geheim for this testbed. The env var overrides either.
+DEFAULT_PASSWORD = "geheim"
 DEFAULT_PORT = 830
+
+DEFAULT_CLI_USER = "admin"
+DEFAULT_CLI_PORT = 22
 
 
 def _ts() -> str:
@@ -89,6 +97,39 @@ examples:
                    help=f"NETCONF port (default {DEFAULT_PORT})")
     p.add_argument("--timeout", type=int, default=30,
                    help="per-RPC timeout in seconds (default 30)")
+
+    t = p.add_argument_group(
+        "transport",
+        "NETCONF is preferred and is always tried first. The CLI collector "
+        "exists because the GA-3.06 firmware stopped starting the NETCONF "
+        "server even with `netconf server` in the running-config; it is a "
+        "fallback, never a replacement.")
+    t.add_argument("--transport", choices=("auto", "netconf", "cli"),
+                   default="auto",
+                   help="auto (default): probe NETCONF per switch and fall "
+                        "back to the ISTAX CLI only where it does not answer. "
+                        "netconf: never fall back, report the failure. "
+                        "cli: skip the probe and read over the CLI.")
+    t.add_argument("--probe-timeout", type=float, default=3.0,
+                   help="seconds to wait on the NETCONF port probe (default 3)")
+    t.add_argument("--cli-user",
+                   default=os.environ.get("ISTAX_USER", DEFAULT_CLI_USER),
+                   help=f"switch CLI username (env ISTAX_USER, "
+                        f"default {DEFAULT_CLI_USER})")
+    t.add_argument("--cli-password",
+                   default=os.environ.get("ISTAX_PASSWORD", ""),
+                   help="switch CLI password (env ISTAX_PASSWORD). Prefer the "
+                        "environment variable over the command line.")
+    t.add_argument("--cli-port", type=int,
+                   default=int(os.environ.get("ISTAX_PORT", DEFAULT_CLI_PORT)),
+                   help=f"switch SSH port (default {DEFAULT_CLI_PORT})")
+    t.add_argument("--cli-all-defaults", action="store_true",
+                   help="also capture `show running-config all-defaults`. "
+                        "Port-level frame preemption is omitted from the plain "
+                        "running-config (AN1185 §6), so this completes Qbu.")
+    t.add_argument("--no-legacy-ssh", action="store_true",
+                   help="do not retry SSH with SHA-1 era algorithms when "
+                        "negotiation fails")
     p.add_argument("--workers", type=int, default=5,
                    help="how many switches to query concurrently (default 5)")
     p.add_argument("--out", default="results",
@@ -113,34 +154,148 @@ examples:
     return p
 
 
-def discover_one(target: dict, args, raw_root: str, log) -> nc.SwitchResult:
-    raw_dir = os.path.join(raw_root, target["name"])
-    session = nc.SwitchSession(
-        name=target["name"],
-        host=target["host"],
-        port=args.port,
-        username=args.user,
-        password=args.password,
-        timeout=args.timeout,
-        raw_dir=raw_dir,
-        logger=log,
+def netconf_port_open(host: str, port: int, timeout: float) -> bool:
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def probe_netconf(target: dict, args, log) -> dict:
+    """Decide, per switch, whether NETCONF is usable before committing to it.
+
+    Two stages, because they fail differently and the difference is
+    diagnostic. A refused TCP connection means nothing is listening -- the
+    symptom of the GA-3.06 regression. A TCP connection that opens but whose
+    session then fails means the server is there and something else is
+    wrong (credentials, SSH negotiation), which the CLI fallback would not
+    fix and which the operator should see rather than have papered over.
+    """
+    host = target["host"]
+    probe = {"port": args.port, "tcp_open": None, "responding": False,
+             "kind": None, "reason": None}
+
+    probe["tcp_open"] = netconf_port_open(host, args.port, args.probe_timeout)
+    if not probe["tcp_open"]:
+        probe["kind"] = "port-closed"
+        probe["reason"] = (
+            f"nothing is listening on {host}:{args.port}. If `netconf server` "
+            "is present in the running-config, this is the GA-3.06 firmware "
+            "regression, not a configuration problem.")
+        return probe
+
+    probe["responding"] = True
+    probe["reason"] = f"TCP {args.port} accepted the connection"
+    return probe
+
+
+def discover_one(target: dict, args, raw_root: str, log):
+    """Collect one switch, choosing the transport.
+
+    Returns ``(transport, result, probe)`` where *result* is either a
+    ``netconf.SwitchResult`` or an ``istax.CliResult``.
+    """
+    name, host = target["name"], target["host"]
+    raw_dir = os.path.join(raw_root, name)
+    probe: Optional[dict] = None
+
+    if args.transport in ("auto", "netconf"):
+        probe = probe_netconf(target, args, log)
+        if probe["responding"]:
+            session = nc.SwitchSession(
+                name=name, host=host, port=args.port,
+                username=args.user, password=args.password,
+                timeout=args.timeout, raw_dir=raw_dir, logger=log,
+            )
+            try:
+                session.connect()
+                if session.result.reachable:
+                    nc.collect(session, full_dump=args.full_dump)
+                    return "netconf", session.result, probe
+                probe["responding"] = False
+                probe["kind"] = session.result.connect_error_kind
+                probe["reason"] = session.result.connect_error
+            finally:
+                session.close()
+
+        if args.transport == "netconf":
+            failed = nc.SwitchResult(name=name, host=host, port=args.port,
+                                     raw_dir=raw_dir)
+            failed.connect_error = probe["reason"]
+            failed.connect_error_kind = probe["kind"] or "no-netconf"
+            return "netconf", failed, probe
+
+        log(f"  [{name}] NETCONF not responding ({probe['kind']}); "
+            "falling back to the ISTAX CLI")
+
+    # --- CLI fallback -----------------------------------------------------
+    session = istax.IstaxSession(
+        name=name, host=host, port=args.cli_port,
+        username=args.cli_user, password=args.cli_password,
+        timeout=args.timeout, raw_dir=raw_dir, logger=log,
+        legacy_algorithms=not args.no_legacy_ssh,
     )
     try:
         session.connect()
-        nc.collect(session, full_dump=args.full_dump)
+        istax.collect(
+            session,
+            interface_lister=lambda r: [i["name"]
+                                        for i in istax_parse_mod.parse_interfaces(r)],
+            all_defaults=args.cli_all_defaults,
+        )
     finally:
         session.close()
-    return session.result
+    return "cli", session.result, probe
 
 
-def result_from_raw(name: str, host: str, raw_dir: str) -> nc.SwitchResult:
-    """Rebuild a SwitchResult from a previous run's raw XML captures."""
+def cli_result_from_raw(name: str, host: str, raw_dir: str) -> istax.CliResult:
+    """Rebuild a CliResult from a previous run's captured command output."""
+    result = istax.CliResult(name=name, host=host, port=DEFAULT_CLI_PORT,
+                             raw_dir=raw_dir)
+    files = [f for f in sorted(os.listdir(raw_dir)) if f.endswith(".txt")]
+    if not files:
+        result.connect_error = f"no CLI output captured in {raw_dir}"
+        result.connect_error_kind = "no-raw-data"
+        return result
+    result.reachable = True
+    for fname in files:
+        key = fname[:-4]
+        with open(os.path.join(raw_dir, fname), "r", encoding="utf-8") as fh:
+            body = fh.read()
+        command = ""
+        if body.startswith("! command:"):
+            first, _, body = body.partition("\n")
+            command = first.split(":", 1)[1].strip()
+        result.captures[key] = istax.CliCapture(
+            key=key, command=command, ok=True, text=body)
+    return result
+
+
+def result_from_raw(name: str, host: str, raw_dir: str):
+    """Rebuild a result from a previous run, whichever transport made it.
+
+    Returns ``(transport, result)``. A directory holding ``.xml`` is a
+    NETCONF capture; one holding ``.txt`` is a CLI capture. A run that fell
+    back mid-way can contain both, in which case NETCONF wins -- it is the
+    better record and the fallback only ran because NETCONF had failed
+    before any XML was written.
+    """
+    has_xml = has_txt = False
+    if os.path.isdir(raw_dir):
+        contents = os.listdir(raw_dir)
+        has_xml = any(f.endswith(".xml") for f in contents)
+        has_txt = any(f.endswith(".txt") for f in contents)
+    if has_txt and not has_xml:
+        return "cli", cli_result_from_raw(name, host, raw_dir)
+
     result = nc.SwitchResult(name=name, host=host, port=DEFAULT_PORT,
                              raw_dir=raw_dir)
     if not os.path.isdir(raw_dir):
         result.connect_error = f"no raw capture directory {raw_dir}"
         result.connect_error_kind = "no-raw-data"
-        return result
+        return "netconf", result
     contents = sorted(os.listdir(raw_dir))
     if not any(f.endswith(".xml") for f in contents):
         # An empty capture directory means the live run never got a reply
@@ -150,7 +305,7 @@ def result_from_raw(name: str, host: str, raw_dir: str) -> nc.SwitchResult:
                                 "-- the switch did not answer during the "
                                 "original run")
         result.connect_error_kind = "no-raw-data"
-        return result
+        return "netconf", result
     result.reachable = True
 
     hello = os.path.join(raw_dir, "hello-capabilities.json")
@@ -173,7 +328,7 @@ def result_from_raw(name: str, host: str, raw_dir: str) -> nc.SwitchResult:
         result.captures[key] = nc.Capture(
             key=key, operation="replay", filter_xml=None, ok=True,
             xml=xml, bytes=len(xml))
-    return result
+    return "netconf", result
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -205,9 +360,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             dev = inventory.by_name(name)
             targets.append({"name": name,
                             "host": dev.primary_ip if dev else "replay"})
-        results = [result_from_raw(t["name"], t["host"],
-                                   os.path.join(raw_root, t["name"]))
-                   for t in targets]
+        results = []
+        for t in targets:
+            transport, result = result_from_raw(
+                t["name"], t["host"], os.path.join(raw_root, t["name"]))
+            results.append((transport, result, None))
         log(f"Re-analysing {len(results)} switches from {raw_root} "
             "(no network access)")
     else:
@@ -216,18 +373,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("error: no switches to contact. SYSTEM.md lists none "
                   "matching SW<n>, and no --switch was given.", file=sys.stderr)
             return 2
-        if not nc.NCCLIENT_AVAILABLE:
+        if args.transport != "cli" and not nc.NCCLIENT_AVAILABLE:
             print(f"error: ncclient is not importable "
                   f"({nc.NCCLIENT_IMPORT_ERROR}).", file=sys.stderr)
-            print("       run scripts/setup_env.sh, then re-run from the venv.",
+            print("       run scripts/setup_env.sh, then re-run from the venv,",
+                  file=sys.stderr)
+            print("       or pass --transport cli to read over the switch CLI.",
                   file=sys.stderr)
             return 2
+        if args.transport != "netconf" and not istax.PARAMIKO_AVAILABLE:
+            print(f"error: paramiko is not importable "
+                  f"({istax.PARAMIKO_IMPORT_ERROR}); the CLI fallback needs it.",
+                  file=sys.stderr)
+            print("       run scripts/setup_env.sh.", file=sys.stderr)
+            return 2
+        if args.transport != "netconf" and not args.cli_password:
+            print("warning: no CLI password set. Export ISTAX_PASSWORD (or pass "
+                  "--cli-password) or the fallback cannot log in.",
+                  file=sys.stderr)
 
         run_dir = os.path.abspath(os.path.join(args.out, run_id))
         raw_root = os.path.join(run_dir, "raw")
         log(f"Run {run_id} -> {run_dir}")
-        log(f"Contacting {len(targets)} switches as '{args.user}' "
-            f"on port {args.port} ({args.workers} in parallel)")
+        log(f"Contacting {len(targets)} switches ({args.workers} in parallel), "
+            f"transport={args.transport}")
+        if args.transport == "auto":
+            log(f"  NETCONF as '{args.user}' on port {args.port}; "
+                f"CLI fallback as '{args.cli_user}' on port {args.cli_port}")
 
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
             results = list(pool.map(
@@ -237,15 +409,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     records: Dict[str, dict] = {}
     lldp_by_switch: Dict[str, List[dict]] = {}
 
-    for result in results:
-        probe_result = probe_mod.probe(result)
-        record = caps_mod.build(result, probe_result)
-        record["ptp"] = probe_mod.ptp_finding(probe_result)
+    for transport, result, probe in results:
+        if transport == "cli":
+            record = cli_record_mod.build(result, netconf_probe=probe)
+            neighbours = record["lldp"]["neighbours"]
+        else:
+            probe_result = probe_mod.probe(result)
+            record = caps_mod.build(result, probe_result)
+            record["ptp"] = probe_mod.ptp_finding(probe_result)
+            record["transport"] = "netconf"
+            record["transport_detail"] = {"protocol": "ssh",
+                                          "port": result.port,
+                                          "netconf_probe": probe}
+            record.setdefault("notes", [])
+            neighbours, local_lldp = topo_mod.parse_lldp(result.xml_of("lldp"))
+            record["lldp"] = {"local": local_lldp, "neighbours": neighbours}
 
-        neighbours, local_lldp = topo_mod.parse_lldp(result.xml_of("lldp"))
-        record["lldp"] = {"local": local_lldp, "neighbours": neighbours}
         lldp_by_switch[result.name] = neighbours
-
         records[result.name] = record
 
     builder = topo_mod.TopologyBuilder(inventory, records, lldp_by_switch)
@@ -258,8 +438,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "inventory": inv_path,
         "mode": "reanalyse" if args.reanalyse else "live",
-        "targets": [{"name": r.name, "host": r.host} for r in results],
+        "transport_requested": args.transport,
+        "targets": [{"name": r.name, "host": r.host, "transport": t}
+                    for t, r, _ in results],
+        "transports_used": {
+            t: sorted(r.name for tt, r, _ in results if tt == t)
+            for t in sorted({t for t, _, _ in results})
+        },
         "ncclient_available": nc.NCCLIENT_AVAILABLE,
+        "paramiko_available": istax.PARAMIKO_AVAILABLE,
     }
 
     cnc_doc = cnc_mod.build(records, topo, inventory, run_meta)
@@ -308,7 +495,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     log(f"Topology      : {os.path.join(run_dir, 'topology.md')}")
     log(f"Capabilities  : {os.path.join(run_dir, 'capabilities.md')}")
     log(f"CNC input     : {os.path.join(run_dir, 'cnc-input.json')}")
-    log(f"Raw NETCONF   : {raw_root}")
+    log(f"Raw captures  : {raw_root}  "
+        f"(.xml = NETCONF, .txt = CLI)")
 
     unreachable = [n for n, r in records.items() if not r.get("reachable")]
     if unreachable:

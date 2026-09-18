@@ -8,10 +8,15 @@ input stage of a future Centralized Network Configuration (CNC) entity.
 netopeer2 NETCONF server backed by sysrepo, addressed 192.168.1.10–.14.
 Client side: UP-1 (192.168.1.61).
 
-**Status:** implementation complete and fully exercised offline — 38 tests,
-including the live session path against a stand-in NETCONF transport.
-**It has never been run against a real KSwitch D10.** Section 9 states
-precisely what that means. Read it before trusting any output.
+**Status:** implementation complete and fully exercised offline — 100 tests.
+Since the GA-3.06 firmware update the switches' NETCONF server no longer
+starts, so the tool now has a **second transport**: it probes NETCONF, and
+where NETCONF does not answer it reads the same information over the ISTAX
+CLI and maps it onto the same YANG shapes (§5.10). That fallback also closes
+the PTP gap (§4). **The NETCONF path has still never run against a real
+KSwitch D10**; the CLI parsers are tested against real captured output.
+Section 9 states precisely what is and is not verified. Read it before
+trusting any output.
 
 ---
 
@@ -192,6 +197,37 @@ installed" and "the schedule is running against a valid time base" are two
 separate claims, and NETCONF can only support the first. The second must come
 from somewhere else.
 
+**This is unchanged in AN001 v1.3.** The v1.3 revision (which adds only the
+default username and password to the document) carries exactly the same
+eleven-module table. So the gap is not a documentation lag that a newer
+application note closes.
+
+**The CLI collector closes it, at a cost.** §5.10 describes the fallback
+transport added after the GA-3.06 regression. Among the things the ISTAX CLI
+prints and NETCONF does not is the whole PTP surface: `show ptp 0 default`,
+`current`, `parent`, `time-property`, `port-state` and `slave`, plus the
+`ptp 0 ...` lines of the running configuration. `tsn_discovery/ptp.py` maps
+those onto **RFC 8575 (`ietf-ptp`)** node names -- `default-ds`,
+`current-ds`, `parent-ds`, `time-properties-ds`, `port-ds-list` -- rather
+than inventing field names, for three reasons: the record stays uniform
+whatever the transport; a CNC has one standard place to look for the time
+base; and if Kontron ever ships a PTP YANG module the data is already in its
+shape, so only the collector changes.
+
+On top of the datasets, `ptp.lock_assessment()` produces the verification
+gate REPORT §8 previously listed as the highest-value missing piece: a
+verdict of `locked`, `out-of-tolerance`, `not-synchronised` or `unknown`,
+derived from the offset from master and the per-port PTP state, with
+`safe_to_schedule` as its bottom line. It is deliberately advisory and says
+so -- one sample is not a synchronisation guarantee, and the honest answer
+when PTP cannot be read at all is `unknown`, never "fine".
+
+What this does **not** fix: PTP is still unreachable from NETCONF, so a CNC
+cannot configure the time base through the same channel it configures Qbv,
+and the read it does get is screen-scraped rather than schema-validated. The
+CNC gap list records this as `impact: degraded-read-only` rather than
+quietly dropping the gap once the CLI can answer.
+
 **How the tool handles it.** It does not pretend. `probe.ptp_finding()`
 emits a structured record with `status: "not-exposed-via-netconf"`, the
 evidence (which module names were searched for and in which sources), and the
@@ -230,6 +266,8 @@ rather than scraped, `<rpc-error>` arrives as a structured exception instead
 of a line of text, and session setup exposes the `<hello>` capability list,
 which is the single most valuable thing on the wire for this task and which
 `netopeer2-cli` does not surface in a machine-readable form at all.
+
+This is not contradicted by the CLI collector added in §5.9. That collector exists because the NETCONF server stopped running at all, not because scraping was reconsidered as a way to talk to a working one; it drives the switch's own ISTAX CLI rather than wrapping `netopeer2-cli`; and NETCONF still wins whenever it answers.
 
 `netopeer2-cli` is kept for what it is good at: `scripts/preflight.sh` uses
 it, if present, as an independent cross-check that a human can reproduce by
@@ -379,7 +417,75 @@ An `<rpc-error>` in particular is treated as data, not as a failure. "Unknown
 element" in response to a filter for a model is the switch telling us it does
 not implement that model — which is exactly what discovery is for.
 
-### 5.9 Exit codes
+### 5.9 The CLI fallback, and why it is a fallback
+
+After the switches were updated to firmware **GA-3.06**, the NETCONF server
+stopped starting. The evidence is unambiguous and worth recording precisely,
+because it determines whose bug it is:
+
+* `netconf server` **is** present in `show running-config`.
+* Nothing is listening on port 830: a client gets `Connection refused`, a
+  TCP RST, not a timeout -- so this is not a filter.
+* From the switch's own Linux shell, `ps` shows no `netopeer2-server` and no
+  `sysrepo` process, and `netstat -ltn` shows no socket on 830.
+
+Configured but not running is a firmware regression, not a configuration
+error. It is Kontron's to fix. In the meantime the testbed still needs its
+topology and capabilities, so `tsn_discovery/istax.py`,
+`istax_parse.py`, `ptp.py` and `cli_record.py` read the same information
+over the ISTAX CLI.
+
+**The fallback never pre-empts NETCONF.** `cli.py` probes per switch: a TCP
+connect to 830, and if that opens, a real NETCONF session. Only when the
+probe fails does that switch drop to the CLI, and the probe's reason is
+recorded in the record and rendered in `capabilities.md` §1. A run can be
+mixed -- four switches over NETCONF and one over the CLI -- and the output
+is one coherent document either way. `--transport netconf` disables the
+fallback so a broken switch reports as broken instead of being papered over;
+`--transport cli` forces it, for testing.
+
+**Uniformity is the design constraint.** `cli_record.build()` emits exactly
+the keys `capabilities.build()` emits: same nesting, same units
+(nanoseconds throughout), same decoded gate bitmasks. The CLI prints
+`GateStates 0x1f` where NETCONF sends `31`, and prints `GateOperation
+set-hold` where the YANG model says `set-and-hold-mac`; both are normalised
+at parse time, so `topology.py`, `cnc.py` and `render.py` need no knowledge
+of the transport. A test asserts the two record shapes have not drifted,
+because a drift would be silent -- a consumer would read `None` where it
+expected a value and nothing would raise.
+
+**What the CLI genuinely cannot supply** is recorded as `None` with the
+omission named, never guessed:
+
+| Field | NETCONF | CLI |
+|---|---|---|
+| `supported-list-max` | yes | yes (`SupportedListMax`) |
+| `supported-cycle-max` | yes | **not printed** |
+| `supported-interval-max` | yes | **not printed** |
+| YANG module list and revisions | yes | n/a -- features evidenced by which command the firmware accepted |
+| PTP | **no module exists** | yes (§4) |
+
+Losing two of the three Qbv limits is the real cost: they are what let a CNC
+know whether a computed schedule is installable before it tries. The
+`network_capability_envelope` therefore reports them as `null` for a
+CLI-read network rather than leaving a stale or invented number in place.
+
+Other properties carried over from the NETCONF collector deliberately:
+every command's output is written to `raw/<switch>/*.txt` before anything
+parses it, so `--reanalyse` works identically for both transports; failures
+are isolated per switch; and the module is **read-only by construction** --
+`istax.run()` refuses any command that is not a `show`, enforced at the
+point of execution rather than left to convention.
+
+Two parsing details were forced by the real output rather than by taste.
+`show mac address-table` prints no dashed separator under its header, unlike
+every other table, so the column geometry is inferred from the header itself
+with a run of two or more spaces as the break -- splitting on whitespace
+would destroy `MAC Address` and the port-range column. And `show vlan`
+writes nineteen characters into a ten-dash `Interfaces` column, so the last
+column of every table is treated as open-ended.
+
+### 5.10 Exit codes
 
 `0` every target switch answered and the topology agrees with the inventory;
 `1` discovery ran but something needs a human; `2` discovery could not run.
@@ -436,6 +542,26 @@ bridge base address, `SYSTEM.md` MAC, `ietf-system` hostname, `SYSTEM.md`
 name, LLDP management address, and finally the flagged OUI-prefix fallback.
 Links are merged across directions, FDB attachments are added under the
 conditions in §5.3, and the cross-check runs.
+
+**`istax.py`** — the CLI transport. An SSH interactive shell (ISTAX has no
+usable exec subsystem), answering the `-- more --` pager with `g` so a long
+`show running-config` arrives whole, stripping ANSI, and refusing any
+command that is not a `show`. It also retries SSH with the SHA-1 era
+algorithms these switches still offer, which is why it connects where a
+current OpenSSH client fails on key exchange.
+
+**`istax_parse.py`** — the CLI parsers, producing the YANG shapes. Table
+geometry from the dashed separator where there is one and from the header
+otherwise; `key : value` blocks for the TSN status commands; running-config
+split into global and per-interface. Gate masks parse from hex or decimal,
+`GateOperation` maps to the `ieee802-dot1q-sched` operation names, and
+`110 ms` / `4300 seconds, 500 nanoseconds` both normalise to nanoseconds.
+
+**`ptp.py`** — PTP into RFC 8575 shape, plus the lock assessment (§4).
+
+**`cli_record.py`** — assembles a CLI-read switch into the record
+`capabilities.build()` would have produced, and derives feature support from
+which commands the firmware accepted rather than from a module list.
 
 **`cnc.py`** — the normalised interchange document (§7).
 
@@ -498,11 +624,14 @@ explicit statement of which standard knobs this firmware does not expose.
 
 **Missing, and in rough order of effort:**
 
-1. **A gPTP verification gate.** The highest-value next step, and it follows
-   directly from §4. The information exists — `i226-adaptation` already reads
-   gPTP offset with `pmc` on both PCs. Wiring that into the discovery output
-   so the CNC can refuse to trust a schedule on an unsynchronised network
-   closes the one gap that is genuinely blocking.
+1. ~~**A gPTP verification gate.**~~ **Done**, via the CLI collector:
+   `ptp.lock_assessment()` returns a verdict and a `safe_to_schedule` boolean
+   derived from the offset from master and the per-port PTP state (§4). Two
+   caveats keep this from being finished business — it works only where a
+   switch is read over the CLI, so restoring NETCONF does not restore it, and
+   a single sample is not a synchronisation guarantee. A campaign should
+   still re-check around every measurement point, as `i226-adaptation` does
+   with `pmc`.
 2. **The write path.** `edit-config` against `ieee802-dot1q-sched`, with
    pre-validation against the envelope this tool already produces, and an
    explicit re-read to confirm what landed. The AN001 examples in §16–21 are
@@ -526,8 +655,8 @@ explicit statement of which standard knobs this firmware does not expose.
 
 ## 9. Verification status
 
-**Exercised.** 38 offline tests pass (`python3 -m unittest discover -s tests`),
-covering:
+**Exercised.** 100 offline tests pass
+(`python3 -m unittest discover -s tests`), covering:
 
 - The **live session code path** — `SwitchSession.connect()`, `collect()`,
   raw capture, session close — driven against a stand-in transport that
@@ -560,10 +689,51 @@ is marked `SYNTHETIC` and run directories it creates carry a `SYNTHETIC`
 marker file, mirroring the interlock in
 `i226-adaptation/analysis/make_fixture.py`.
 
-**Never executed.** **Nothing in this subproject has ever contacted a
-KSwitch D10.** No NETCONF session has been established against the real
-hardware, no reply has been parsed from a real switch, and no topology has
-been discovered. Specifically unverified:
+**Exercised against real switch output.** The CLI parsers are tested on
+genuine captured output from KSwitchTSN-1 (192.168.1.10, GA-3.06): `show
+lldp neighbors`, `show mac address-table`, `show interface * status`,
+`show vlan` and `show running-config`. From that capture the tool correctly
+derives the hostname, the bridge base address, the management address, all
+eight ports with their speeds and PVIDs, both VLANs, the 28 filtering-database
+entries, the LLDP adjacency to KSwitchTSN-2 on Gi 1/5, and — importantly —
+attaches CTRL to Gi 1/1 while declining to attach the twelve other MACs
+learned through the Gi 1/5 trunk. The PTP, Qbv, Qbu and QoS parsers are
+tested against the worked examples in Microchip AN1185 and AN1295, which is
+real output from Microchip's reference hardware rather than this testbed;
+those fixtures are marked `SYNTHETIC`.
+
+A separate test asserts that the CLI record and the NETCONF record have the
+same keys at every level that downstream code reads. That is the one failure
+mode uniformity has: a drift would not raise, it would silently hand a
+consumer `None`.
+
+**Never executed.** **No NETCONF session has ever been established against a
+KSwitch D10** — and since GA-3.06 none can be, because the server does not
+start. No NETCONF reply has been parsed from real hardware. The CLI
+collector has never been run end to end against a live switch either: its
+parsers are tested against a captured transcript, but the transport itself
+(SSH negotiation, the pager, per-interface command generation, the
+switch-wide-then-per-port strategy) has not met a real session.
+Specifically unverified:
+
+- **The CLI transport against a live switch.** Whether the `-- more --`
+  pager answers to `g` as the application note says, whether the prompt
+  regex matches every state the CLI can be in, whether the SHA-1 retry is
+  needed or sufficient, and whether `show tsn tas status` without an
+  interface argument is accepted (the tool tries it and falls back to
+  per-interface, so either way works, but the fast path is untested).
+- Whether `show ptp 0 port-state` is accepted without an interface argument.
+  AN1295 only ever shows it with one.
+- Whether port numbering really follows the `show interface * status`
+  ordering on hardware with a different port mix. It is corroborated on this
+  hardware by LLDP reporting Port ID 4 for GigabitEthernet 1/4, and the
+  derivation is labelled in the output rather than presented as read.
+- Whether queue index equals priority index for frame preemption. The CLI
+  configures preemption per queue and `ieee802-dot1q-preemption` models it
+  per priority; the mapping is stated in the record as an assumption that
+  holds under the default 1:1 priority-to-traffic-class map.
+
+And, for the NETCONF path, unchanged from before:
 
 - That the NETCONF server is enabled on any of the five switches. AN001 §5 is
   explicit that it does not start automatically and must be enabled from the
@@ -588,8 +758,11 @@ been discovered. Specifically unverified:
   shapes the parser handles.
 - Whether the five switches are on the same firmware release.
 
-**Conclusion: the tool is verified to be correct against the documented data
-model. It is not verified to work against the hardware.** The first real run
+**Conclusion: the NETCONF path is verified against the documented data model
+and cannot currently be verified against the hardware at all. The CLI path
+is verified against real output from this testbed for the commands a
+transcript exists for, and against vendor examples for the rest, but its
+transport has not met a live session.** The first real run
 is a test of the vendor's implementation as much as of this code, which is
 why every reply is captured raw and why `--reanalyse` exists. Expect the
 first run to need one round of parser adjustment, and expect the raw captures

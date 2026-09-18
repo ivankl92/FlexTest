@@ -63,6 +63,8 @@ def build(records: Dict[str, dict], topo: dict, inventory,
             bridges.append({
                 "id": name,
                 "reachable": False,
+                "transport": rec.get("transport", "netconf"),
+                "transport_detail": rec.get("transport_detail"),
                 "management": {"address": rec.get("host"),
                                "protocol": "netconf", "port": 830},
                 "error": rec.get("errors"),
@@ -135,7 +137,10 @@ def build(records: Dict[str, dict], topo: dict, inventory,
         bridges.append({
             "id": name,
             "reachable": True,
+            "transport": rec.get("transport", "netconf"),
+            "transport_detail": rec.get("transport_detail"),
             "hostname": (rec.get("system") or {}).get("hostname"),
+            "firmware": (rec.get("system") or {}).get("firmware"),
             "management": {"address": rec.get("host"),
                            "protocol": "netconf", "port": 830},
             "bridge": {
@@ -173,19 +178,65 @@ def build(records: Dict[str, dict], topo: dict, inventory,
         return any(b["capabilities"][key]["supported"] for b in reachable)
 
     gaps: List[dict] = []
-    if not _any_support("ptp"):
+
+    # PTP has three distinct states now and they call for different
+    # responses, so they are not collapsed into one gap.
+    ptp_via_cli = sorted(b["id"] for b in reachable
+                         if (b.get("ptp") or {}).get("status")
+                         == "available-via-cli")
+    ptp_absent = sorted(b["id"] for b in reachable
+                        if (b.get("ptp") or {}).get("status")
+                        not in ("available", "available-via-cli"))
+
+    if ptp_absent and not ptp_via_cli:
         gaps.append({
             "capability": "ptp",
             "impact": "blocking-for-verification",
-            "detail": "No PTP/gPTP YANG module on any reachable switch. A CNC "
-                      "cannot read the time base its Qbv base-times are "
-                      "anchored to, nor confirm gPTP lock, over NETCONF. "
-                      "Schedules can be installed but not time-verified "
-                      "through this interface.",
-            "workaround": "Verify gPTP out of band (ISTAX CLI 'show ptp', or "
-                          "ptp4l/pmc on the endpoints as the i226-adaptation "
-                          "measurement already does) before trusting a "
-                          "schedule.",
+            "detail": "No PTP/gPTP YANG module on any reachable switch, and no "
+                      "CLI reading either. A CNC cannot read the time base its "
+                      "Qbv base-times are anchored to, nor confirm gPTP lock. "
+                      "Schedules can be installed but not time-verified.",
+            "affects": ptp_absent,
+            "workaround": "Verify gPTP out of band (ISTAX CLI `show ptp 0 "
+                          "current`, or ptp4l/pmc on the endpoints as the "
+                          "i226-adaptation measurement already does) before "
+                          "trusting a schedule.",
+        })
+    elif ptp_via_cli:
+        gaps.append({
+            "capability": "ptp",
+            "impact": "degraded-read-only",
+            "detail": "PTP is readable, but only over the ISTAX CLI: this "
+                      "hardware implements no PTP or gPTP YANG module in "
+                      "either AN001 v1.2 or v1.3. A CNC therefore gets the "
+                      "time base through a screen-scraped, unversioned "
+                      "interface, and cannot configure PTP through the same "
+                      "channel it configures Qbv.",
+            "affects": ptp_via_cli,
+            "workaround": "Treat the CLI PTP read as a verification gate "
+                          "before installing or trusting a schedule, and "
+                          "re-check it around each measurement point rather "
+                          "than once per campaign.",
+        })
+
+    cli_bridges = sorted(b["id"] for b in reachable
+                         if b.get("transport") == "cli")
+    if cli_bridges:
+        gaps.append({
+            "capability": "transport",
+            "impact": "degraded",
+            "detail": "These bridges were read over the ISTAX CLI because "
+                      "their NETCONF server did not answer. CLI reads carry no "
+                      "schema validation, the output format is not versioned "
+                      "between firmware releases, and NETCONF's transactional "
+                      "machinery (candidate datastore, validate, "
+                      "confirmed-commit, rollback-on-error) is unavailable — "
+                      "which matters most for the write path a CNC will need.",
+            "affects": cli_bridges,
+            "workaround": "Restore the NETCONF server. `netconf server` being "
+                          "present in the running-config while nothing listens "
+                          "on port 830 is a firmware regression to raise with "
+                          "the manufacturer, not a configuration error.",
         })
     if not _any_support("qci"):
         gaps.append({

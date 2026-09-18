@@ -8,3 +8,8 @@
 
 ncclient>=0.6.13
 lxml>=4.9.0
+
+# paramiko arrives as an ncclient dependency, but the ISTAX CLI fallback
+# (tsn_discovery/istax.py) imports it directly, so it is declared here too
+# rather than relied on transitively.
+paramiko>=2.11.0

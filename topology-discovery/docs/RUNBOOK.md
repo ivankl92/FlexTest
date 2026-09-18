@@ -36,8 +36,13 @@ never been run against a real KSwitch D10.
 **Switch access**
 
 - The NETCONF server **enabled** on every switch (§2 — it does not start on
-  its own).
-- Credentials. `SYSTEM.md` records `netconf` / `geheim`.
+  its own). On firmware GA-3.06 it does not start even when enabled; §6
+  covers what the tool does about that.
+- NETCONF credentials. `SYSTEM.md` records `netconf` / `geheim`; AN001 v1.3
+  documents the factory default as `netconf` / `netconf`.
+- **Switch CLI credentials** — the `admin` account you would use for
+  `ssh admin@192.168.1.10`. Needed by the CLI fallback (§6.1), and not the
+  same as the NETCONF credentials.
 
 **Reference addresses** (from `SYSTEM.md`)
 
@@ -102,7 +107,7 @@ Verify from the CLI before blaming the tool:
 ```
 
 If that shows neighbours but discovery does not, the plugin is not
-populating `remote-systems-data` over NETCONF — see §8.6.
+populating `remote-systems-data` over NETCONF — see §9.6.
 
 ### 2.3 Know the datastore caveat
 
@@ -281,7 +286,103 @@ parallel. `--full-dump` adds a few seconds per switch.
 
 ---
 
-## 6. Output
+## 6. When NETCONF does not answer
+
+Since firmware **GA-3.06** the switches' NETCONF server no longer starts,
+even though `netconf server` is still in the running configuration. The tool
+handles that itself: it probes NETCONF on every switch and falls back to
+reading the same information over the ISTAX CLI where the probe fails. You
+do not have to choose a transport — but you do have to supply CLI
+credentials, or the fallback cannot log in.
+
+### 6.1 Set the CLI credentials
+
+```bash
+export ISTAX_USER=admin              # default; the switch admin account
+read -rs ISTAX_PASSWORD; export ISTAX_PASSWORD
+./scripts/run_discovery.sh
+```
+
+`read -rs` keeps the password out of your shell history. These are the
+*switch CLI* credentials (the account you use for `ssh admin@192.168.1.10`),
+not the NETCONF ones — `netconf`/`geheim` is a NETCONF account and will not
+log in to the CLI.
+
+### 6.2 Choosing a transport explicitly
+
+```bash
+./scripts/run_discovery.sh                        # auto (default)
+./scripts/run_discovery.sh --transport netconf    # never fall back
+./scripts/run_discovery.sh --transport cli        # skip the probe
+```
+
+Use `--transport netconf` when you want a broken switch to *report* as
+broken — for example when checking whether a firmware fix has landed. Use
+`--transport cli` to exercise the fallback while NETCONF is working.
+
+A run can be mixed. Four switches over NETCONF and one over the CLI produces
+one coherent set of documents, and every record says which transport
+produced it.
+
+### 6.3 What you lose on the CLI
+
+The output shape is identical — same keys, same units, same decoded gate
+masks — so `topology.md`, `capabilities.md` and `cnc-input.json` read the
+same way. What differs:
+
+| | NETCONF | CLI |
+|---|---|---|
+| Schema validation | yes | none — output is parsed text |
+| Format stability | versioned YANG modules | can change between firmware releases |
+| `supported-list-max` (Qbv) | yes | yes |
+| `supported-cycle-max`, `supported-interval-max` | yes | **not printed — reported as null** |
+| YANG module list | yes | n/a; features evidenced by which command was accepted |
+| **PTP** | **no module exists** | **yes** — see §6.4 |
+| Transactional writes (candidate, validate, rollback) | yes | none |
+
+The two missing Qbv limits matter for a CNC: they are what say whether a
+computed schedule will fit. `network_capability_envelope` reports them as
+`null` on a CLI-read network rather than carrying a stale number.
+
+### 6.4 What you gain: PTP
+
+PTP is the one thing the CLI has and NETCONF does not, on any firmware.
+`capabilities.md` §3 gains a table with the profile, offset from master,
+mean path delay, steps removed, servo state and a **lock verdict**:
+
+| Verdict | Meaning |
+|---|---|
+| `locked` | offset within tolerance (default 1 µs) — `safe_to_schedule: true` |
+| `out-of-tolerance` | PTP running but the offset is too large |
+| `not-synchronised` | every PTP port disabled, initializing or faulty |
+| `unknown` | PTP could not be read at all |
+
+It is advisory and based on one sample. Before trusting a Qbv schedule, keep
+checking gPTP around each measurement point the way `i226-adaptation`
+already does with `pmc`.
+
+### 6.5 Confirming the NETCONF regression on a switch
+
+Worth doing once per switch, and worth quoting to Kontron:
+
+```
+KSwitchTSN-1# show running-config | include netconf
+netconf server                     <- configured
+
+KSwitchTSN-1# debug system shell
+~ # ps | grep -E 'netopeer|sysrepo'  <- no process
+~ # netstat -ltn | grep 830          <- no listener
+```
+
+Configured, not running, nothing listening. From UP-1 the same fault shows
+as `Connection refused` — a TCP reset, not a timeout, so it is not a
+firewall. The tool records all of this: `capabilities.md` §1 states, per
+switch, that `netconf server` is present in the running-config while the
+server did not answer.
+
+---
+
+## 7. Output
 
 ```
 results/<run-id>/
@@ -314,7 +415,7 @@ specific run only if it is worth keeping as a reference.
 
 ---
 
-## 7. Reading the output
+## 8. Reading the output
 
 ### 7.1 Start with the console summary
 
@@ -348,7 +449,7 @@ run.
 §5 is the cross-check against `SYSTEM.md`. A switch listed there that
 discovery did not see is a fault. An endpoint not observed usually is not —
 an end station that neither runs LLDP nor has transmitted recently has no
-FDB entry and is invisible to both methods (§8.7).
+FDB entry and is invisible to both methods (§9.7).
 
 ### 7.3 `capabilities.md`
 
@@ -387,30 +488,43 @@ jq '.network.bridges[].ports[] | select(.role=="inter-switch")
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 Error kinds come from `run.json` and the console. Each maps to one cause.
 
-### 8.1 `connection-refused` / TCP 830 closed
+### 9.1 `connection-refused` / TCP 830 closed
 
-The NETCONF server is not running. It does not start automatically — §2.1.
-Verify from the switch CLI, then re-run preflight.
+Nothing is listening on the NETCONF port. Two different causes, and the
+running-config tells them apart:
 
-### 8.2 `timeout` / `unreachable`
+```
+KSwitchTSN-1# show running-config | include netconf
+```
+
+- **No output** — the server was never enabled. §2.1 enables it.
+- **`netconf server`** — configured but not running. This is the **GA-3.06
+  firmware regression**: the daemon does not start. Nothing you can
+  configure fixes it; it is the manufacturer's to repair, and §6.5 gathers
+  the evidence for a ticket.
+
+Either way discovery keeps working: with CLI credentials set (§6.1) the run
+falls back automatically and says so rather than failing.
+
+### 9.2 `timeout` / `unreachable`
 
 No route or the switch is down. Check with `ping 192.168.1.10`. If ICMP
 works but NETCONF times out, a firewall or ACL is filtering 830, or the
 switch is too loaded to accept an SSH session — retry with
 `--workers 1 --timeout 60`.
 
-### 8.3 `auth-failed`
+### 9.3 `auth-failed`
 
 Wrong username or password. The defaults come from `SYSTEM.md` (`netconf` /
 `geheim`). Override with `NETCONF_USER` / `NETCONF_PASSWORD`. If the
 credentials are right, check the account still exists on the switch and has
 NETCONF access.
 
-### 8.4 `ssh-error` during key exchange
+### 9.4 `ssh-error` during key exchange
 
 Embedded SSH stacks sometimes offer only algorithms that recent paramiko
 disables by default. Test the raw transport first:
@@ -424,12 +538,12 @@ algorithm it names. A per-host SSH config entry re-enabling it usually fixes
 the interactive case; for ncclient, `netopeer2-cli` is the fallback path for
 that switch and `--reanalyse` can still process whatever was captured.
 
-### 8.5 `rpc-error` on one subtree, others fine
+### 9.5 `rpc-error` on one subtree, others fine
 
 Normal and informative: the switch does not implement that model. It is
 recorded in `run.json` and reflected in the feature matrix. Nothing to fix.
 
-### 8.6 LLDP returns nothing / no switch-to-switch links
+### 9.6 LLDP returns nothing / no switch-to-switch links
 
 The most likely real problem, and REPORT.md §9 flags it as the largest
 unverified risk. Work through it in this order:
@@ -452,7 +566,7 @@ unverified risk. Work through it in this order:
      `SYSTEM.md` and treat the discovered part as a partial result. Note it
      as a firmware limitation, not a tool defect.
 
-### 8.7 An endpoint does not appear
+### 9.7 An endpoint does not appear
 
 It has no filtering-database entry, because it has not transmitted recently
 or the entry has aged out. Make it talk and re-run:
@@ -466,13 +580,13 @@ Devices that never transmit unprompted — the NXP MIMXRT1170 boards in an
 idle state — may need traffic generated from them or a shorter FDB aging
 time.
 
-### 8.8 Discovery disagrees with `SYSTEM.md`
+### 9.8 Discovery disagrees with `SYSTEM.md`
 
 That is the tool working. Discovery reports the network; `SYSTEM.md` reports
 what someone wrote down. Check the cabling, then update `SYSTEM.md` — do not
 adjust the tool to match the document.
 
-### 8.9 A parser looks wrong
+### 9.9 A parser looks wrong
 
 Do not go back to the bench. The raw XML is already saved:
 
@@ -485,7 +599,51 @@ less results/<run-id>/raw/SW1/interfaces.xml
 `--reanalyse` re-runs the entire parse and render pipeline against the saved
 bytes and contacts nothing.
 
-### 8.10 `ncclient not importable`
+### 9.10 The CLI fallback cannot log in
+
+`auth-failed` on the CLI transport means the *switch* credentials are wrong.
+`ISTAX_USER` defaults to `admin`; the NETCONF account (`netconf`) is not a
+CLI user and will not work there. Test by hand:
+
+```bash
+ssh admin@192.168.1.10
+```
+
+If that itself fails during key exchange, see §9.11.
+
+### 9.11 `ssh-algorithm-mismatch` on the CLI transport
+
+The switch offers only SHA-1 era algorithms and a current client refuses
+them. The tool already retries with those re-enabled, so this error means
+the retry failed too. Check what plain SSH does:
+
+```bash
+ssh -o KexAlgorithms=+diffie-hellman-group1-sha1 \
+    -o HostKeyAlgorithms=+ssh-rsa \
+    -o PubkeyAcceptedAlgorithms=+ssh-rsa admin@192.168.1.10
+```
+
+If that works and the tool does not, report the exact error rather than
+working around it. `--no-legacy-ssh` disables the retry to get the raw
+failure.
+
+### 9.12 A CLI read returns nothing for Qbv, Qbu or PTP
+
+Two harmless cases and one worth chasing:
+
+- **No schedule configured.** `show tsn tas status` has nothing to say about
+  a port with no gate control list. The record shows the port as Qbv-capable
+  with an empty list, which is correct.
+- **Command not in this release.** The record marks the feature
+  `supported: false` with the evidence *the firmware rejected `<command>`*.
+  That is a discovery result, not a failure.
+- **Command timed out.** `show running-config` on a busy switch can exceed
+  the per-command timeout. Raise it with `--timeout 60`.
+
+Whichever it is, the raw text is in `results/<run-id>/raw/<switch>/*.txt` and
+`--reanalyse` re-parses it without touching the switch.
+
+### 9.13 `ncclient not importable`
 
 The virtualenv is missing or the wrong python is being used. Re-run
 `./scripts/setup_env.sh`. `run_discovery.sh` prefers `.venv/bin/python3`
@@ -493,7 +651,7 @@ automatically.
 
 ---
 
-## 9. Changing the setup
+## 10. Changing the setup
 
 ### Different addresses or new switches
 
@@ -533,7 +691,7 @@ Runs accumulate under `results/`; prune them by age.
 
 ---
 
-## 10. Feeding a CNC
+## 11. Feeding a CNC
 
 `cnc-input.json` is the network half of the IEEE 802.1Qcc fully-centralized
 model. To build on it:
@@ -560,9 +718,9 @@ model. To build on it:
 
 ---
 
-## 11. If LLDP is unavailable
+## 12. If LLDP is unavailable
 
-If §8.6 concludes the firmware does not expose LLDP remote systems data,
+If §9.6 concludes the firmware does not expose LLDP remote systems data,
 discovery still produces value, and this is the degraded procedure:
 
 - Endpoint attachment from the FDB still works and is the part that changes
@@ -581,7 +739,7 @@ built that way is confidently wrong — REPORT.md §5.3.
 
 ---
 
-## 12. Security notes
+## 13. Security notes
 
 - The NETCONF password defaults to the lab value recorded in `SYSTEM.md`.
   This is a closed test network; on any network that is not, set
@@ -596,39 +754,60 @@ built that way is confidently wrong — REPORT.md §5.3.
 
 ---
 
-## 13. Testing without hardware
+## 14. Testing without hardware
 
 The full pipeline can be exercised offline, which is how it was developed:
 
 ```bash
-# 38 tests: parsers, live session path, topology, CNC document
+# 100 tests: parsers for both transports, live session path, topology,
+# CNC document, and the NETCONF-vs-CLI record uniformity check
 python3 -m unittest discover -s tests -v
 
-# generate a synthetic five-switch capture and analyse it end to end
+# NETCONF: a synthetic five-switch capture, analysed end to end
 python3 tests/make_fixture.py --out results/synthetic-001
 python3 -m tsn_discovery.cli --reanalyse results/synthetic-001 \
         --inventory ../SYSTEM.md --no-publish
+
+# CLI: split a real pasted terminal session into per-command captures
+python3 tests/make_cli_fixture.py --out results/cli-fixture \
+        --from-transcript /path/to/your/session.txt
+python3 -m tsn_discovery.cli --reanalyse results/cli-fixture \
+        --inventory ../SYSTEM.md --no-publish
 ```
 
-Everything the fixture generator writes is fabricated. Each synthetic run
-directory carries a `SYNTHETIC` marker file. Never cite a synthetic run as a
-property of the testbed — the same interlock as
+`make_cli_fixture.py` is the more useful of the two day to day: paste a
+session of `show` commands from any switch into a file and it becomes a
+replayable capture. Commands your transcript did not contain are filled from
+the Microchip AN1185 and AN1295 worked examples, so the remaining parsers
+are still exercised.
+
+Everything not taken from your transcript is from the vendor's reference
+hardware or fabricated. Each run directory carries a `SYNTHETIC` marker
+naming the origin of every file. Never cite such a run as a property of the
+testbed — the same interlock as
 `i226-adaptation/analysis/make_fixture.py`.
+
+`--reanalyse` also works on any real run directory, so a parser can be fixed
+and re-run against output already captured, without going back to the
+bench.
 
 ---
 
-## 14. Reproducibility checklist
+## 15. Reproducibility checklist
 
 Before recording a discovery run as a reference:
 
 - [ ] `scripts/preflight.sh` exits 0.
 - [ ] LLDP has been enabled for longer than one transmit interval on every
       relevant port.
-- [ ] Every endpoint you expect to see has transmitted recently (§8.7).
+- [ ] Every endpoint you expect to see has transmitted recently (§9.7).
 - [ ] The NETCONF server has been restarted since the last CLI or web-UI
       configuration change (§2.3).
 - [ ] `run_discovery.sh` exits 0, or the non-zero reason is understood and
       recorded.
+- [ ] The transport each switch used is recorded (`capabilities.md` §1). A run
+      that fell back to the CLI is not directly comparable with one that did
+      not — two of the Qbv capability limits are missing from a CLI read.
 - [ ] `topology.md` §5 shows no unexplained discrepancy.
 - [ ] `capabilities.md` §2 shows the same feature set on all five switches —
       a difference means a firmware mismatch.
