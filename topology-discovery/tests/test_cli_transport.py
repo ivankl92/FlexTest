@@ -60,8 +60,12 @@ Interface  Mode     Speed   Aneg       Media Type SFP Family   Link    Operation
 ---------- -------- ------- ---------- ---------- ------------ ------- --------------------
 Gi 1/1     Enabled  Auto    Yes        RJ45       N/A          1Gfdx
 Gi 1/2     Enabled  Auto    Yes        RJ45       N/A          Down
+Gi 1/3     Enabled  Auto    Yes        RJ45       N/A          Down
+Gi 1/4     Enabled  Auto    Yes        RJ45       N/A          Down
 Gi 1/5     Enabled  Auto    Yes        RJ45       N/A          1Gfdx
+Gi 1/6     Enabled  Auto    Yes        RJ45       N/A          Down
 2.5G 1/1   Enabled  Auto    Yes        SFP        None         Down
+2.5G 1/2   Enabled  Auto    Yes        SFP        None         Down
 """
 
 SAMPLE_VLAN = """\
@@ -102,6 +106,10 @@ interface GigabitEthernet 1/5
  tsn frame-preemption queue 1
  ptp 0
  ptp 0 delay-mechanism p2p
+ ptp 0 announce interval 0 timeout 3
+ ptp 0 sync-interval -3
+ ptp 0 delay-req interval 0
+ ptp 0 gptp-interval 0
 !
 interface vlan 1
  ip address 192.168.1.10 255.255.255.0
@@ -189,7 +197,7 @@ class TestNaming(unittest.TestCase):
 class TestTableParsing(unittest.TestCase):
     def test_dashed_separator_table(self):
         rows = P.parse_table(SAMPLE_IFSTATUS)
-        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(rows), 8)
         self.assertEqual(rows[0]["Interface"], "Gi 1/1")
         self.assertEqual(rows[0]["Media Type"], "RJ45")   # multi-word header
         self.assertEqual(rows[0]["Link"], "1Gfdx")
@@ -242,7 +250,21 @@ class TestInterfaces(unittest.TestCase):
 
     def test_names_and_order(self):
         self.assertEqual([i["name"] for i in self.ifaces],
-                         ["2.5G 1/1", "Gi 1/1", "Gi 1/2", "Gi 1/5"])
+                         ["2.5G 1/1", "2.5G 1/2", "Gi 1/1", "Gi 1/2",
+                          "Gi 1/3", "Gi 1/4", "Gi 1/5", "Gi 1/6"])
+
+    def test_port_numbers_follow_table_order_not_sorted_order(self):
+        """The record is sorted by name for readability, but port numbers
+        must come from the switch's own table order: Gi 1/1..1/6 = 1..6,
+        then 2.5G 1/1..1/2 = 7..8. LLDP corroborates this by reporting Port
+        ID 4 for GigabitEthernet 1/4."""
+        by_name = {i["name"]: i["bridge_port"]["port_number"]
+                   for i in self.ifaces}
+        self.assertEqual(by_name["Gi 1/1"], 1)
+        self.assertEqual(by_name["Gi 1/4"], 4)
+        self.assertEqual(by_name["Gi 1/6"], 6)
+        self.assertEqual(by_name["2.5G 1/1"], 7)
+        self.assertEqual(by_name["2.5G 1/2"], 8)
 
     def test_link_decoded(self):
         gi1 = next(i for i in self.ifaces if i["name"] == "Gi 1/1")
@@ -370,21 +392,119 @@ class TestPtp(unittest.TestCase):
             self.record["sync_summary"]["offset_from_master_ns"], -0.386,
             places=6)
 
-    def test_rfc8575_shape(self):
-        inst = self.record["instances"][0]
+    def test_all_three_models_emitted(self):
+        self.assertEqual(set(self.record["models"]),
+                         {"ietf-ptp", "ieee1588-ptp-tt",
+                          "ieee802-dot1as-gptp"})
+
+    def test_each_model_names_its_module_and_reference(self):
+        for key, model in self.record["models"].items():
+            self.assertEqual(model["module"], key)
+            self.assertTrue(model["reference"], key)
+            self.assertTrue(model["namespace"].startswith("urn:"), key)
+
+    # --- ietf-ptp (RFC 8575) --------------------------------------------
+    def test_ietf_ptp_shape(self):
+        inst = self.record["models"]["ietf-ptp"]["instance-list"][0]
         for key in ("default-ds", "current-ds", "parent-ds",
                     "time-properties-ds", "port-ds-list"):
             self.assertIn(key, inst, key)
 
-    def test_clock_quality_decomposed(self):
-        q = self.record["instances"][0]["default-ds"]["clock-quality"]
-        self.assertEqual(q["clock-class"], 248)
+    def test_ietf_ptp_uses_2008_terminology(self):
+        cur = self.record["models"]["ietf-ptp"]["instance-list"][0]["current-ds"]
+        self.assertIn("offset-from-master", cur)
+        self.assertIn("mean-path-delay", cur)
+        self.assertNotIn("offset-from-time-transmitter", cur)
 
-    def test_port_states_mapped_to_enum(self):
-        states = {p["port-number"]: p["port-state"]
-                  for p in self.record["instances"][0]["port-ds-list"]}
+    def test_ietf_ptp_port_states_keep_2008_role_names(self):
+        ports = self.record["models"]["ietf-ptp"]["instance-list"][0]["port-ds-list"]
+        states = {p["port-number"]: p["port-state"] for p in ports}
         self.assertEqual(states[5], "slave")
         self.assertEqual(states[1], "master")
+
+    def test_clock_quality_decomposed(self):
+        ds = self.record["models"]["ietf-ptp"]["instance-list"][0]["default-ds"]
+        self.assertEqual(ds["clock-quality"]["clock-class"], 248)
+
+    # --- ieee1588-ptp-tt (IEEE 1588-2019) -------------------------------
+    def test_ieee1588_uses_2019_terminology(self):
+        inst = self.record["models"]["ieee1588-ptp-tt"]["instances"]["instance"][0]
+        cur = inst["current-ds"]
+        self.assertIn("offset-from-time-transmitter", cur)
+        self.assertIn("mean-delay", cur)
+        self.assertNotIn("offset-from-master", cur)
+
+    def test_ieee1588_port_states_use_2019_role_names(self):
+        inst = self.record["models"]["ieee1588-ptp-tt"]["instances"]["instance"][0]
+        states = {p["port-number"]: p["port-ds"]["port-state"]
+                  for p in inst["ports"]["port"]}
+        self.assertEqual(states[5], "time-receiver")
+        self.assertEqual(states[1], "time-transmitter")
+
+    def test_ieee1588_nests_ports(self):
+        """1588-2019 uses ports/port/port-ds, not a flat port-ds-list."""
+        inst = self.record["models"]["ieee1588-ptp-tt"]["instances"]["instance"][0]
+        self.assertIn("ports", inst)
+        self.assertNotIn("port-ds-list", inst)
+        self.assertIn("port-ds", inst["ports"]["port"][0])
+
+    def test_same_reading_under_both_names(self):
+        """The renamed leaves must carry identical values."""
+        ietf = self.record["models"]["ietf-ptp"]["instance-list"][0]["current-ds"]
+        ieee = (self.record["models"]["ieee1588-ptp-tt"]
+                ["instances"]["instance"][0]["current-ds"])
+        self.assertEqual(ietf["offset-from-master"],
+                         ieee["offset-from-time-transmitter"])
+        self.assertEqual(ietf["mean-path-delay"], ieee["mean-delay"])
+
+    # --- ieee802-dot1as-gptp (IEEE 802.1AS-2020) ------------------------
+    def test_dot1as_is_augmentation_only(self):
+        """802.1AS defines no top-level containers, so the projection must
+        not pretend to carry the base datasets."""
+        m = self.record["models"]["ieee802-dot1as-gptp"]
+        self.assertIn("augments", m)
+        self.assertNotIn("instance-list", m)
+        self.assertNotIn("instances", m)
+        self.assertIn("augments", m["path"])
+
+    def test_dot1as_lifts_time_properties_into_default_ds(self):
+        aug = self.record["models"]["ieee802-dot1as-gptp"]["augments"]
+        self.assertIn("ptp-timescale", aug["default-ds"])
+        self.assertIn("time-source", aug["default-ds"])
+
+    def test_dot1as_profile_detected(self):
+        m = self.record["models"]["ieee802-dot1as-gptp"]
+        self.assertTrue(m["profile_active"])
+        self.assertEqual(m["profile_reported"], "802.1as")
+
+    def test_dot1as_port_augmentations(self):
+        ports = self.record["models"]["ieee802-dot1as-gptp"]["augments"][
+            "ports/port/port-ds"]
+        by_num = {p["port-number"]: p for p in ports}
+        self.assertTrue(by_num[5]["is-measuring-delay"])
+        self.assertEqual(by_num[5]["current-log-sync-interval"], -3)
+
+    def test_as_capable_is_not_invented(self):
+        """The most useful gPTP predicate is not printed by the CLI. It must
+        be absent and the absence explained, not guessed from Peer-delay."""
+        m = self.record["models"]["ieee802-dot1as-gptp"]
+        ports = m["augments"]["ports/port/port-ds"]
+        for port in ports:
+            self.assertNotIn("as-capable", port)
+        self.assertTrue(any("as-capable" in u for u in m["unavailable"]))
+
+    def test_every_model_declares_gaps_and_inferences(self):
+        for key, model in self.record["models"].items():
+            self.assertTrue(model["unavailable"], f"{key} claims no gaps")
+            self.assertIsInstance(model["derived"], list, key)
+
+    def test_gptp_interval_has_a_standard_home(self):
+        """`ptp 0 gptp-interval` was previously stored under an invented
+        name; 802.1AS calls it current-log-gptp-cap-interval."""
+        ports = self.record["models"]["ieee802-dot1as-gptp"]["augments"][
+            "ports/port/port-ds"]
+        self.assertTrue(any("current-log-gptp-cap-interval" in p
+                            for p in ports))
 
     def test_grandmaster_identity(self):
         self.assertEqual(self.record["sync_summary"]["grandmaster_identity"],
@@ -555,3 +675,47 @@ class TestRecordUniformity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestPtpPortJoin(unittest.TestCase):
+    """The port-number join between `show ptp 0 port-state` and
+    `show interface * status` is the one place PTP state could be attached
+    to the wrong interface. An interface table that does not account for a
+    PTP port must be reported, not silently absorbed."""
+
+    def test_unmatched_ptp_port_is_flagged(self):
+        texts = dict(_full_result()._texts)
+        texts["ptp-port-state"] = (
+            "Port  Enabled  PTP-State  Internal  Link  Peer-delay\n"
+            "----  -------  ---------  --------  ----  ----------\n"
+            "5     TRUE     slve       FALSE     Up    OK\n"
+            "99    TRUE     mstr       FALSE     Up    OK\n")
+        result = _FakeResult(texts)
+        cfg = P.parse_running_config(SAMPLE_RUNNING)
+        ifaces = P.parse_interfaces(result)
+        P.apply_interface_config(ifaces, cfg)
+        record = ptp_mod.build(result, cfg, ifaces)
+
+        self.assertTrue(any("99" in w for w in record["warnings"]))
+        ports = record["models"]["ietf-ptp"]["instance-list"][0]["port-ds-list"]
+        orphan = next(p for p in ports if p["port-number"] == 99)
+        self.assertNotIn("underlying-interface", orphan)
+
+    def test_matched_port_carries_its_interface(self):
+        record = ptp_mod.build(
+            _full_result(),
+            P.parse_running_config(SAMPLE_RUNNING),
+            _configured_interfaces())
+        ports = record["models"]["ietf-ptp"]["instance-list"][0]["port-ds-list"]
+        by_num = {p["port-number"]: p for p in ports}
+        self.assertEqual(by_num[5]["underlying-interface"], "Gi 1/5")
+        self.assertEqual(by_num[1]["underlying-interface"], "Gi 1/1")
+        self.assertEqual(record["warnings"], [])
+
+
+def _configured_interfaces():
+    result = _full_result()
+    cfg = P.parse_running_config(SAMPLE_RUNNING)
+    ifaces = P.parse_interfaces(result)
+    P.apply_interface_config(ifaces, cfg)
+    return ifaces

@@ -361,6 +361,27 @@ It is advisory and based on one sample. Before trusting a Qbv schedule, keep
 checking gPTP around each measurement point the way `i226-adaptation`
 already does with `pmc`.
 
+The same reading is written into `capabilities.json` under
+`ptp.models`, projected into **three** standard YANG shapes at once:
+
+| Key | Module | Models | Use it if |
+|---|---|---|---|
+| `ietf-ptp` | RFC 8575, rev 2019-05-06 | IEEE 1588-2008 | your consumer expects `offset-from-master`, `mean-path-delay`, flat `port-ds-list` |
+| `ieee1588-ptp-tt` | rev 2023-08-14 | IEEE 1588-2019 | your consumer expects `offset-from-time-transmitter`, `mean-delay`, nested `ports/port/port-ds` |
+| `ieee802-dot1as-gptp` | rev 2025-02-04 | IEEE 802.1AS-2020 | you want the gPTP-specific leaves (`current-log-gptp-cap-interval`, `is-measuring-delay`) |
+
+They are three spellings of one observation, not three readings — the same
+measured offset appears under both the 2008 and 2019 leaf names. The
+802.1AS module defines no top-level containers; it augments the 1588-2019
+tree, so its projection carries only the augmentation leaves and expects
+`ieee1588-ptp-tt` underneath it.
+
+Each projection lists `unavailable` (nodes the model defines that the CLI
+does not print) and `derived` (values filled by inference, with the
+inference stated). Notably `as-capable` is **absent, not guessed** — the
+CLI never prints it, and a fabricated value would be a time base nobody
+verified. REPORT §4.1 explains the choice.
+
 ### 6.5 Confirming the NETCONF regression on a switch
 
 Worth doing once per switch, and worth quoting to Kontron:

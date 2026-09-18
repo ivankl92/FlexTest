@@ -282,7 +282,7 @@ def capabilities_markdown(records: Dict[str, dict], cnc_doc: dict,
     A("No switch implements a PTP or gPTP YANG module — the module list is "
       "unchanged between AN001 v1.2 and v1.3 — so PTP is never readable over "
       "NETCONF on this hardware. Where it appears below it came from the CLI "
-      "collector and is mapped onto RFC 8575 (`ietf-ptp`) node names. "
+      "collector and is projected into three YANG models side by side. "
       "See REPORT.md §4.")
     A("")
     ptp_rows = [(n, r) for n, r in sorted(records.items())
@@ -305,10 +305,40 @@ def capabilities_markdown(records: Dict[str, dict], cnc_doc: dict,
               f'| {s.get("servo_state") or "-"} '
               f'| **{lock.get("verdict", "unknown")}** |')
         A("")
-        A("A lock verdict is advisory and based on a single sample. A "
-          "measurement campaign should re-check before and after every point, "
-          "as `i226-adaptation` does with `pmc` on the end stations.")
+        A("A lock verdict is advisory and based on a single sample, and "
+          "`as-capable` — the gPTP predicate that would settle it — is not "
+          "printed by the CLI. A measurement campaign should re-check before "
+          "and after every point, as `i226-adaptation` does with `pmc` on the "
+          "end stations.")
         A("")
+        models = (ptp_rows[0][1]["ptp"].get("models") or {})
+        if models:
+            A("**Projected into three YANG models.** The same readings appear "
+              "under each model's own node names in `capabilities.json` at "
+              "`ptp.models`, so a consumer can use whichever matches its data "
+              "model without this tool having chosen for it:")
+            A("")
+            A("| Model | Reference | Path | Nodes the CLI cannot fill |")
+            A("|---|---|---|---|")
+            for key, m in models.items():
+                A(f'| `{key}` | {m.get("reference","-")} '
+                  f'| `{m.get("path","-")}` '
+                  f'| {len(m.get("unavailable", []))} |')
+            A("")
+            A("`ieee802-dot1as-gptp` defines no top-level containers — it "
+              "augments the `ieee1588-ptp-tt` tree — so its projection holds "
+              "only the gPTP-specific additions and the base datasets live in "
+              "the 1588 projection. Note also that IEEE 1588-2019 renamed the "
+              "roles: `offset-from-master` is `offset-from-time-transmitter` "
+              "there, and the port states `master`/`slave` are "
+              "`time-transmitter`/`time-receiver`. Each projection lists what "
+              "it could not fill and which values were inferred rather than "
+              "read.")
+            A("")
+        for name, rec in ptp_rows:
+            for warn in (rec["ptp"].get("warnings") or []):
+                A(f"> **{name}:** {warn}")
+                A("")
 
     A("## 4. Qbv (802.1Qbv time-aware shaper) capability envelope")
     A("")

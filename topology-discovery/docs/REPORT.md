@@ -202,17 +202,64 @@ default username and password to the document) carries exactly the same
 eleven-module table. So the gap is not a documentation lag that a newer
 application note closes.
 
-**The CLI collector closes it, at a cost.** §5.10 describes the fallback
+**The CLI collector closes it, at a cost.** §5.9 describes the fallback
 transport added after the GA-3.06 regression. Among the things the ISTAX CLI
 prints and NETCONF does not is the whole PTP surface: `show ptp 0 default`,
 `current`, `parent`, `time-property`, `port-state` and `slave`, plus the
 `ptp 0 ...` lines of the running configuration. `tsn_discovery/ptp.py` maps
-those onto **RFC 8575 (`ietf-ptp`)** node names -- `default-ds`,
-`current-ds`, `parent-ds`, `time-properties-ds`, `port-ds-list` -- rather
-than inventing field names, for three reasons: the record stays uniform
-whatever the transport; a CNC has one standard place to look for the time
-base; and if Kontron ever ships a PTP YANG module the data is already in its
-shape, so only the collector changes.
+those onto standard YANG node names rather than inventing field names, for
+three reasons: the record stays uniform whatever the transport; a CNC has one
+standard place to look for the time base; and if Kontron ever ships a PTP
+YANG module the data is already in its shape, so only the collector changes.
+
+### 4.1 Why all three PTP models, and not one
+
+The first version of the collector projected onto RFC 8575 (`ietf-ptp`)
+alone. That was the wrong single choice, and rather than swap it for a
+different single choice the collector now emits **all three** projections
+side by side, from one neutral observation of the CLI output.
+
+| Module | Revision | Models | Shape |
+|---|---|---|---|
+| `ietf-ptp` | 2019-05-06 | IEEE 1588-2008 | `/ptp/instance-list`, flat `port-ds-list` |
+| `ieee1588-ptp-tt` | 2023-08-14 | IEEE 1588-2019 | `/ptp/instances/instance`, nested `ports/port/port-ds` |
+| `ieee802-dot1as-gptp` | 2025-02-04 | IEEE 802.1AS-2020 | augments only -- no top-level containers of its own |
+
+Three things forced this.
+
+**802.1AS is a layer, not a peer.** `ieee802-dot1as-gptp` imports
+`ieee1588-ptp-tt` and augments its tree; it defines no top-level container.
+So "map to 802.1AS instead of 1588" is not a choice that can be made --
+emitting the gPTP augmentations at all *requires* emitting the 1588-2019 tree
+underneath them. A projection that named only 802.1AS would be a fiction.
+
+**The two 1588 lineages disagree on names, not on values.** IEEE 1588-2019
+renamed the leaves that matter most: `offset-from-master` became
+`offset-from-time-transmitter`, `mean-path-delay` became `mean-delay`,
+`slave-only` became `time-receiver-only`, and the port states `master` and
+`slave` became `time-transmitter` and `time-receiver`. A consumer written
+against RFC 8575 and a consumer written against the 2019 module are both
+correct and neither can read the other's document. The collector carries the
+same measured value under both names -- the projections are two spellings of
+one observation, not two readings.
+
+**This testbed runs gPTP, and gPTP data has a standard home.** The
+`ptp 0 gptp-interval 0` line of the running config, and the
+`is-measuring-delay` / neighbour-rate-ratio state the CLI prints, are
+802.1AS concepts with no node in either 1588 module. Under the previous
+single-model mapping they sat in invented field names. They now sit in
+`ieee802-dot1as-gptp`'s own augmentation leaves --
+`current-log-gptp-cap-interval`, `is-measuring-delay` -- where a gPTP-aware
+CNC will look for them.
+
+Each projection declares its `module`, `revision`, `reference` and
+`namespace`, and carries two honesty lists: `unavailable`, for nodes the
+model defines that the CLI does not print, and `derived`, for values filled
+by inference, each with the inference stated. `as-capable` is the pointed
+example: 802.1AS defines it, the CLI does not print it, and it would be easy
+to fake from the port state. It is left absent, with the reason recorded,
+because a CNC that trusts a fabricated `as-capable` would schedule against a
+time base nobody verified.
 
 On top of the datasets, `ptp.lock_assessment()` produces the verification
 gate REPORT §8 previously listed as the highest-value missing piece: a
@@ -557,7 +604,8 @@ split into global and per-interface. Gate masks parse from hex or decimal,
 `GateOperation` maps to the `ieee802-dot1q-sched` operation names, and
 `110 ms` / `4300 seconds, 500 nanoseconds` both normalise to nanoseconds.
 
-**`ptp.py`** — PTP into RFC 8575 shape, plus the lock assessment (§4).
+**`ptp.py`** — one neutral PTP observation projected into `ietf-ptp`,
+`ieee1588-ptp-tt` and `ieee802-dot1as-gptp`, plus the lock assessment (§4).
 
 **`cli_record.py`** — assembles a CLI-read switch into the record
 `capabilities.build()` would have produced, and derives feature support from
